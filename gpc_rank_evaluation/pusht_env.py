@@ -780,9 +780,18 @@ class PushTEnv(gym.Env):
         self.goal_color = pygame.Color(self.target_color)
         self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians)
 
-        # Add collision handeling
-        self.collision_handeler = self.space.add_collision_handler(0, 0)
-        self.collision_handeler.post_solve = self._handle_collision
+        # Add collision handling.
+        # Pymunk API differs across versions:
+        # - older: Space.add_collision_handler(...)
+        # - newer: Space.on_collision(...)
+        if hasattr(self.space, "add_collision_handler"):
+            self.collision_handeler = self.space.add_collision_handler(0, 0)
+            self.collision_handeler.post_solve = self._handle_collision
+        elif hasattr(self.space, "on_collision"):
+            self.space.on_collision(0, 0, post_solve=self._handle_collision)
+            self.collision_handeler = None
+        else:
+            raise AttributeError("Unsupported pymunk Space API: missing collision handler methods.")
         self.n_contact_points = 0
 
         self.max_score = 50 * 100

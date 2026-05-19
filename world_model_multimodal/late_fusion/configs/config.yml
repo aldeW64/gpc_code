@@ -1,0 +1,28 @@
+dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/3d_video_model/data/manifeel_data
+models_save_dir: saved_checkpoints
+
+# Training hyperparameters
+num_epochs: 100
+obs_horizon: 4        # number of past frames fed as conditioning (num_steps_conditioning)
+pred_horizon: 8       # number of future RGB frames predicted per window (autoregressive steps)
+batch_size: 8
+resize_scale: 96      # both RGB and tactile frames are resized to (96 x 96)
+lr: 1.0e-4
+save_every: 1         # save a checkpoint every N epochs
+
+# Logging
+wandb: false
+
+# Late Fusion loss balance
+# loss = loss_alpha * MSE(eps_rgb, target) + (1 - loss_alpha) * MSE(eps_tac, target)
+loss_alpha: 0.5
+
+# Inference composition weights [w_rgb, w_tac]
+# eps_composed = w_rgb * eps_rgb + w_tac * eps_tac
+composition_weights: [0.7, 0.3]
+
+# UNet architecture (shared by both RGB and tactile experts)
+cond_channels: 256
+depths: [2, 2, 2, 2]
+channels: [96, 96, 96, 96]
+attn_depths: [0, 0, 1, 1]

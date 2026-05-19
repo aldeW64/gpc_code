@@ -1,0 +1,31 @@
+# Early Fusion multimodal world model — training configuration
+# ============================================================
+
+# Dataset
+dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/3d_video_model/data/manifeel_data/data
+
+# Output
+models_save_dir: saved_checkpoints
+
+# Training
+num_epochs: 100
+batch_size: 8
+lr: 1.0e-4
+
+# Observation / prediction horizons
+# obs_horizon: number of past fused frames fed as context to the model
+# pred_horizon: number of future steps the model is trained to predict
+#   (the Denoiser iterates autoregressively over pred_horizon steps per batch)
+# window_size = obs_horizon + pred_horizon
+obs_horizon: 4
+pred_horizon: 8
+
+# Image resolution (both front RGB and tactile are resized to this square size)
+resize_scale: 96
+
+# Logging — set to true to enable Weights & Biases logging
+wandb: false
+
+# Optional: path to a checkpoint directory to resume training from.
+# Set to null (or omit) to start from scratch.
+resume_checkpoint: null

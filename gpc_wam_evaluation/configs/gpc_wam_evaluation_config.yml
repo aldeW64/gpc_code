@@ -1,0 +1,76 @@
+seed: 1
+wandb: false
+
+# Switch between world model backends: wam | gpc
+world_model_type: gpc
+
+env:
+  domain_filename: push_t
+  resize_scale: 96
+  max_steps: 300
+
+# Evaluation control loop
+eval:
+  # online_env | offline_dataset
+  mode: online_env
+  obs_horizon: 2
+  pred_horizon: 16
+  action_horizon: 8
+  num_episodes: 100
+  output_dir: gpc_wam_evaluation_output
+  save_video: true
+
+  # Offline evaluation from a zarr dataset (used when mode=offline_dataset)
+  offline_dataset:
+    # zarr_path: dataset/world_model_data/dataset_domain/all_data/domain18.zarr
+    # num_samples: 100
+    # use_dataset_actions: true
+    # start_mode: random  # random | episode_start
+
+# Pick one: diffusion | mppi
+planner_mode: diffusion
+
+# Route A: diffusion-policy candidates
+diffusion_policy:
+  num_diffusion_iters: 100
+  num_candidates: 50
+  policy_checkpoint: ./all_checkpoints/action_policy_checkpoint/checkpoint_epoch_300
+
+# Route B: MPPI candidates
+mppi:
+  num_iterations: 5
+  num_candidates: 256
+  action_noise_sigma: 25.0
+  temperature: 1.0
+  clamp_action_min: 0.0
+  clamp_action_max: 511.0
+
+# ── GPC world model (used when world_model_type: gpc) ──────────────────────
+# Uses the diffusion denoiser from all_checkpoints/world_model_checkpoint.
+# Autoregressively predicts future frames; ranks candidates by -MSE(pred, goal).
+gpc_world_model:
+  ckpt_path: ./all_checkpoints/world_model_checkpoint/phase_two_checkpoint/denoiser.pth
+  num_diffusion_steps: 3       # denoising steps per predicted frame (3 is fast, matches eval_baseline)
+  num_rollout_steps: 8         # future action steps to roll out (matches action_horizon)
+
+# ── WAM (Ctrl-World) world model (used when world_model_type: wam) ─────────
+# Action-conditioned SVD video diffusion model.
+# After fine-tuning on PushT (see wam/scripts/train_wm_pusht_zarr.py), replace:
+#   ckpt_path: ./wam/ckpt/pusht_finetuned/checkpoint-10000.pt
+# NOTE: do NOT use gpc_rank_evaluation's denoiser.pth here — different model.
+wam:
+  ckpt_path: ./wam/ckpt/checkpoint-10000.pt
+  svd_model_path: ./wam/svd
+  clip_model_path: ./wam/clip
+
+  num_history: 6
+  num_frames: 5
+  action_dim: 7
+  width: 320
+  height: 192
+  fps: 7
+  motion_bucket_id: 127
+  guidance_scale: 2.0
+  num_inference_steps: 25
+  decode_chunk_size: 7
+  dtype: fp32  # bf16/fp16 require GPU; use fp32 for CPU-only inference

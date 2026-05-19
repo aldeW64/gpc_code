@@ -1,0 +1,46 @@
+# Middle-Fusion multimodal world model configuration
+# All paths are relative to the directory from which train.py is invoked.
+
+# --------------------------------------------------------------------------
+# Data
+# --------------------------------------------------------------------------
+dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/3d_video_model/data/manifeel_data/data
+models_save_dir: saved_checkpoints
+
+# --------------------------------------------------------------------------
+# Training
+# --------------------------------------------------------------------------
+num_epochs: 100
+batch_size: 8
+lr: 1.0e-4
+wandb: false
+
+# --------------------------------------------------------------------------
+# Sequence horizons
+# --------------------------------------------------------------------------
+# obs_horizon  : number of past frames fed as conditioning context
+# pred_horizon : number of autoregressive future steps trained per sequence
+# Window size  = obs_horizon + pred_horizon + 1 frames total
+obs_horizon: 4
+pred_horizon: 8
+
+# --------------------------------------------------------------------------
+# Image preprocessing
+# --------------------------------------------------------------------------
+# Both front (256x256) and tactile (320x240) images are resized to this square.
+resize_scale: 96
+
+# --------------------------------------------------------------------------
+# Model architecture
+# --------------------------------------------------------------------------
+# cond_channels: dimension of the global FiLM conditioning vector.
+#   Must be divisible by obs_horizon (used for action embedding per step).
+cond_channels: 256
+
+# depths[i]     : number of ResBlocks at UNet level i
+# channels[i]   : feature channels at UNet level i
+# attn_depths[i]: 1 = use self-attention at level i, 0 = no attention
+# Four levels → 3 downsampling steps → bottleneck at 96/8 = 12×12 (for 96px input)
+depths: [2, 2, 2, 2]
+channels: [96, 96, 96, 96]
+attn_depths: [0, 0, 1, 1]

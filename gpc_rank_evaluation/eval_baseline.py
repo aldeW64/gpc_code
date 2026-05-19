@@ -2,17 +2,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import collections
-from diffusers.training_utils import EMAModel
 from tqdm.auto import tqdm
-from skvideo.io import vwrite
 import os
-from utils import *
-from pusht_env import *
-from models import *
+from .utils import *
+from .pusht_env import *
+from .models import *
 import matplotlib.pyplot as plt
-from diffusion.diffusion_sampler import *
-from diffusion.denoiser import *
+from .diffusion.diffusion_sampler import *
+from .diffusion.denoiser import *
 import torchvision.models as models
+from .ema import SimpleEMAModel
 
 
 class RewardPredictor(nn.Module):
@@ -88,6 +87,16 @@ def estimate_reward_torch(block_pose: torch.Tensor, target_pose: torch.Tensor) -
     return reward
 
 def eval_baseline(config, models_save_dir):
+    def _maybe_vwrite(path: str, frames):
+        if not bool(config.get("save_video", True)):
+            return
+        try:
+            from skvideo.io import vwrite  # type: ignore
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "Missing dependency 'skvideo'. Either install scikit-video, or set save_video: false in config."
+            ) from e
+        vwrite(path, frames)
 
     dynamics_stats = {'agent_pos': {'min': np.array([2.0407837e-04, 1.0189312e+00], dtype=np.float32), 'max': np.array([509.08173, 509.43417], dtype=np.float32)}, 'action': {'min': np.array([0., 0.], dtype=np.float32), 'max': np.array([511., 511.], dtype=np.float32)}}
     domain18_stats = {'agent_pos': {'min': np.array([9.897889, 9.63592 ], dtype=np.float32), 'max': np.array([499.517  , 499.00488], dtype=np.float32)}, 'action': {'min': np.array([2., 2.], dtype=np.float32), 'max': np.array([511., 511.], dtype=np.float32)}}
@@ -120,9 +129,7 @@ def eval_baseline(config, models_save_dir):
 
     nets = nets.to(device)
 
-    ema = EMAModel(
-        parameters=nets.parameters(),
-        power=0.75)
+    ema = SimpleEMAModel.from_parameters(nets.parameters(), power=0.75)
         
     for model_name, model in nets.items():
         model_path = os.path.join(models_save_dir, f"{model_name}.pth")
@@ -223,8 +230,9 @@ def eval_baseline(config, models_save_dir):
 
     print("\nEval Diff Policy on Domain #{}:".format(env_id))
 
-    start_number_test = 0
-    end_number_test = start_number_test + 100
+    start_number_test = int(config.get("start_number_test", 0))
+    num_episodes = int(config.get("num_episodes", 100))
+    end_number_test = start_number_test + num_episodes
     env_seed = env_seed + start_number_test
 
     for test_index in range(start_number_test, end_number_test):
@@ -432,7 +440,7 @@ def eval_baseline(config, models_save_dir):
         env_seed += 1
         env_j_scores.append(max(rewards))
         # save the visualization of the first few demos
-        vwrite(os.path.join(output_dir, "baseline_single_dp_on_domain_{}_test_{}.mp4".format(env_id, test_index)), imgs)
+        _maybe_vwrite(os.path.join(output_dir, "baseline_single_dp_on_domain_{}_test_{}.mp4".format(env_id, test_index)), imgs)
         #vwrite(os.path.join(output_dir, "pred_baseline_single_dp_on_domain_{}_test_{}.mp4".format(env_id, test_index)), pred_video_imgs)
 
         np.save(f'corrected_sampling_based_testing_no_simulation_planning_receding_result_from_index_f{start_number_test}.npy', np.array(env_j_scores))

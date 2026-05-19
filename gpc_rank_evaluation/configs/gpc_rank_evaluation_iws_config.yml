@@ -1,0 +1,39 @@
+# GPC-RANK evaluation config using the IWS LatentWorldModel as the world model.
+# Run from repo root:
+#   python -m gpc_rank_evaluation.gpc_rank_evaluation_iws \
+#       --iws_ckpt_path <path/to/stage2_checkpoint.ckpt>
+
+# ---------- diffusion action policy ----------
+num_diffusion_iters: 100
+pred_horizon: 16
+obs_horizon: 2
+action_horizon: 8
+resize_scale: 96
+
+policy_checkpoint: ./all_checkpoints/action_policy_checkpoint/checkpoint_epoch_300
+
+# ---------- reward predictors ----------
+reward_predictor_xy_checkpoint: ./all_checkpoints/reward_checkpoint/reward_predictor_xy.pth
+reward_predictor_angle_checkpoint: ./all_checkpoints/reward_checkpoint/reward_predictor_angle.pth
+
+# ---------- IWS world model ----------
+iws_world_model:
+  # Path to the Lightning checkpoint saved after Stage 2 training.
+  # Also accepted via --iws_ckpt_path CLI argument.
+  ckpt_path: ""
+  # Path to the corresponding Hydra config.yaml (auto-detected if blank).
+  cfg_path: ""
+  # Number of real history frames fed to the IWS encoder.
+  num_history: 1
+  # Number of future action steps to roll out per candidate.
+  num_frames: 8
+
+# ---------- eval settings ----------
+num_trial: 50          # action candidates sampled per step
+num_episodes: 100
+start_number_test: 0
+max_steps: 300
+
+output_dir: gpc_rank_evaluation_output_iws
+save_video: false
+wandb: false

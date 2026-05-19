@@ -3,13 +3,15 @@ import torch
 import argparse
 import wandb
 import yaml
-from eval_baseline import eval_baseline
+from pathlib import Path
+from .eval_baseline import eval_baseline
 
 def main():
     np.random.seed(1)
     torch.manual_seed(1)
+    _default_config = str(Path(__file__).parent / "configs" / "gpc_rank_evaluation_config.yml")
     parser = argparse.ArgumentParser(description='Training script for setting various parameters.')
-    parser.add_argument('--config', type=str, default='./configs/gpc_rank_evaluation_config.yml', help='Path to the configuration YAML file.')
+    parser.add_argument('--config', type=str, default=_default_config, help='Path to the configuration YAML file.')
 
     args = parser.parse_args()
     with open(args.config, 'r') as file:
