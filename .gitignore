@@ -4,4 +4,3 @@ wandb/
 dataset/
 all_checkpoints/
 wam/
-interactive_world_sim/

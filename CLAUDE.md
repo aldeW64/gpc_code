@@ -68,13 +68,22 @@ All modules are configuration-driven via YAML files in `configs/` directories:
 cd diffusion_policy_training
 python train_model.py [--config configs/train_config.yml]
 
-# Train world model - Phase 1 (single-step warmup)
+# Train world model - Phase 1 (single-step warmup) — PushT zarr
 cd world_model_train_phase_one
 python train.py [--config configs/train_phase_one_config.yml]
 
-# Train world model - Phase 2 (multi-step)
+# Train world model - Phase 2 (multi-step) — PushT zarr
 cd world_model_train_phase_two
 python train.py [--config configs/train_phase_two_config.yml]
+
+# Train world model - Phase 1 (single-step warmup) — ManiFEEL 7-DOF
+cd world_model_train_phase_one
+python train_manifeel.py --config configs/train_manifeel_phase_one_config.yml
+
+# Train world model - Phase 2 (multi-step) — ManiFEEL 7-DOF
+# Edit train_manifeel_phase_two_config.yml: set phase_one_checkpoint to the epoch-300 phase-1 denoiser.pth
+cd world_model_train_phase_two
+python train_manifeel.py --config configs/train_manifeel_phase_two_config.yml
 ```
 
 ### Evaluation
@@ -211,6 +220,89 @@ python main.py \
   +name=pusht_stage2
 ```
 
+#### Training IWS on ManiFEEL
+
+Same pipeline as PushT, but use `dataset=manifeel_dataset` and `algorithm.action_dim=7`:
+
+```bash
+cd interactive_world_sim
+
+# Stage 1: train encoder + decoder
+python main.py \
+  experiment=exp_latent_dyn \
+  dataset=manifeel_dataset \
+  algorithm=latent_world_model \
+  algorithm.training_stage=1 \
+  algorithm.action_dim=7 \
+  wandb.entity=dummy \
+  wandb.mode=disabled \
+  +name=manifeel_stage1
+
+# Stage 2: train dynamics (replace <date>/<time>/<step> with actual values)
+python main.py \
+  experiment=exp_latent_dyn \
+  dataset=manifeel_dataset \
+  algorithm=latent_world_model \
+  algorithm.training_stage=2 \
+  algorithm.action_dim=7 \
+  "algorithm.load_ae=outputs/<date>/<time>/checkpoints/<step>.ckpt" \
+  wandb.entity=dummy \
+  wandb.mode=disabled \
+  +name=manifeel_stage2
+```
+
+Config at `interactive_world_sim/configurations/dataset/manifeel_dataset.yaml`. Dataset reads `data/front` as the image key (stored internally under `"image"` to match LatentWorldModel batch format), and `data/action` as 7-DOF actions.
+
+#### Training IWS Multimodal Fusion on ManiFEEL
+
+Three fusion variants using both RGB (`data/front`) and tactile (`data/left_tactile_camera_taxim`). All use `dataset=manifeel_multimodal_dataset`.
+
+```bash
+cd interactive_world_sim
+
+# Early Fusion (6-ch encoder; predicts both RGB + tactile) — Stage 1
+python main.py experiment=exp_latent_dyn dataset=manifeel_multimodal_dataset \
+  algorithm=latent_world_model_early_fusion algorithm.training_stage=1 \
+  algorithm.action_dim=7 wandb.entity=dummy wandb.mode=disabled +name=manifeel_early_stage1
+
+# Early Fusion — Stage 2
+python main.py experiment=exp_latent_dyn dataset=manifeel_multimodal_dataset \
+  algorithm=latent_world_model_early_fusion algorithm.training_stage=2 \
+  algorithm.action_dim=7 \
+  "algorithm.load_ae=outputs/<date>/<time>/checkpoints/<step>.ckpt" \
+  wandb.entity=dummy wandb.mode=disabled +name=manifeel_early_stage2
+
+# Middle Fusion (dual encoder + CrossModalAttention; predicts RGB only) — Stage 1
+python main.py experiment=exp_latent_dyn dataset=manifeel_multimodal_dataset \
+  algorithm=latent_world_model_middle_fusion algorithm.training_stage=1 \
+  algorithm.action_dim=7 wandb.entity=dummy wandb.mode=disabled +name=manifeel_middle_stage1
+
+# Middle Fusion — Stage 2
+python main.py experiment=exp_latent_dyn dataset=manifeel_multimodal_dataset \
+  algorithm=latent_world_model_middle_fusion algorithm.training_stage=2 \
+  algorithm.action_dim=7 \
+  "algorithm.load_ae=outputs/<date>/<time>/checkpoints/<step>.ckpt" \
+  wandb.entity=dummy wandb.mode=disabled +name=manifeel_middle_stage2
+
+# Late Fusion (two independent pipelines; composed at inference) — Stage 1
+python main.py experiment=exp_latent_dyn dataset=manifeel_multimodal_dataset \
+  algorithm=latent_world_model_late_fusion algorithm.training_stage=1 \
+  algorithm.action_dim=7 wandb.entity=dummy wandb.mode=disabled +name=manifeel_late_stage1
+
+# Late Fusion — Stage 2
+python main.py experiment=exp_latent_dyn dataset=manifeel_multimodal_dataset \
+  algorithm=latent_world_model_late_fusion algorithm.training_stage=2 \
+  algorithm.action_dim=7 \
+  "algorithm.load_ae=outputs/<date>/<time>/checkpoints/<step>.ckpt" \
+  wandb.entity=dummy wandb.mode=disabled +name=manifeel_late_stage2
+```
+
+| Algorithm config | Fusion strategy | Output |
+|---|---|---|
+| `latent_world_model_early_fusion` | Concat RGB+tac → 6-ch encoder | 6-ch (RGB + tactile next frame) |
+| `latent_world_model_middle_fusion` | Dual encoders + CrossModalAttention | 3-ch RGB only |
+| `latent_world_model_late_fusion` | Two independent pipelines, composed latents | 3-ch RGB only |
+
 Checkpoints are saved to `interactive_world_sim/outputs/<date>/<time>/checkpoints/`. The Hydra config is at `outputs/<date>/<time>/.hydra/config.yaml` — the IWS adapter auto-detects it.
 
 #### Evaluating with IWS as world model
@@ -325,9 +417,9 @@ Three fusion strategies for training a world model on the ManiFEEL robot manipul
 - **Tactile**: `left_tactile_camera_taxim` camera (320×240 → resized to 96×96)
 - **Actions**: 7-DoF continuous robot actions, normalized to [-1, 1] per dataset
 
-**Dataset path**: `/n/holylabs/ydu_lab/Lab/pwu/Projects/3d_video_model/data/manifeel_data`
+**Dataset path**: `dataset/manifeel/data` (relative to repo root; absolute: `/net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel/data`)
 
-Zarr structure (one store per task under `manifeel_data/data/<task>/`):
+Zarr structure (one store per task under `dataset/manifeel/data/<task>/`):
 - Arrays live under the `data/` group: `data/front`, `data/left_tactile_camera_taxim`, `data/action`
 - Episode boundaries at `meta/episode_ends` (exclusive end indices)
 - Tasks: `nutbolt_quan_July1`, `bulb_quan_Sep19`, `gear_quan_Sep15`, `pih_quan_June06`, `plug_quan_Aug02`, `usb_quan_Aug05`, `blindinsert_quan_Aug15`, `sorting_quan_Aug8`, `explore_quan_June17`

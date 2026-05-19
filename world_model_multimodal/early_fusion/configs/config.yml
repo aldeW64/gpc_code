@@ -2,7 +2,7 @@
 # ============================================================
 
 # Dataset
-dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/3d_video_model/data/manifeel_data/data
+dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel/data
 
 # Output
 models_save_dir: saved_checkpoints

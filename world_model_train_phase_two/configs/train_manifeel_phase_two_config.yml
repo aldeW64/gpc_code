@@ -1,0 +1,17 @@
+dataset_path: ../dataset/manifeel/data
+models_save_dir: saved_checkpoint_manifeel
+output_dir: saved_checkpoint_manifeel
+
+# hyperparams
+num_epochs: 300
+num_train_demos: 500
+# obs_horizon sets num_steps_conditioning; must match phase 1.
+# pred_horizon = obs_horizon + 1 + extra_ar_steps => seq_length = 12 (multi-step).
+obs_horizon: 4
+pred_horizon: 16
+action_horizon: 8
+batch_size: 8
+resize_scale: 96
+wandb: false
+
+phase_one_checkpoint: ../world_model_train_phase_one/saved_checkpoint_manifeel/checkpoint_epoch_300/denoiser.pth
