@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=iws_pusht
+#SBATCH --job-name=iws_manifeel
 #SBATCH --partition=kempner
 #SBATCH --account=kempner_ydu_lab
 #SBATCH --nodes=1
@@ -11,19 +11,17 @@
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
 
-# Run from interactive_world_sim/ directory:
-#   sbatch scripts/train_pusht_slurm.sh [stage1|stage2] [stage1_ckpt_path]
+# Train the single-modality IWS LatentWorldModel on ManiFEEL (front RGB only).
 #
-# Examples:
-#   sbatch scripts/train_pusht_slurm.sh stage1
-#   sbatch scripts/train_pusht_slurm.sh stage2 outputs/2025-01-01/12-00-00/checkpoints/last.ckpt
+# Run from interactive_world_sim/ directory:
+#   sbatch scripts/train_manifeel_slurm.sh stage1
+#   sbatch scripts/train_manifeel_slurm.sh stage2 outputs/<date>/<time>/checkpoints/last.ckpt
 
 set -e
 
 STAGE=${1:-stage1}
 STAGE1_CKPT=${2:-""}
 
-# Activate conda
 source /n/sw/Miniforge3-24.11.3-0/etc/profile.d/conda.sh
 conda activate iws
 
@@ -37,13 +35,13 @@ mkdir -p slurm_logs
 if [ "$STAGE" = "stage1" ]; then
     python main.py \
         experiment=exp_latent_dyn \
-        dataset=pusht_dataset \
+        dataset=manifeel_dataset \
         algorithm=latent_world_model \
         algorithm.training_stage=1 \
-        algorithm.action_dim=2 \
+        algorithm.action_dim=7 \
+        wandb.entity=dummy \
         wandb.mode=disabled \
-        "+load=/n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code/interactive_world_sim/outputs/2026-05-18/12-03-42/checkpoints/latest.ckpt" \
-        "+name=pusht_stage1_${SLURM_JOB_ID}"
+        "+name=manifeel_stage1_${SLURM_JOB_ID}"
 
 elif [ "$STAGE" = "stage2" ]; then
     if [ -z "$STAGE1_CKPT" ]; then
@@ -52,14 +50,14 @@ elif [ "$STAGE" = "stage2" ]; then
     fi
     python main.py \
         experiment=exp_latent_dyn \
-        dataset=pusht_dataset \
+        dataset=manifeel_dataset \
         algorithm=latent_world_model \
         algorithm.training_stage=2 \
-        algorithm.action_dim=2 \
+        algorithm.action_dim=7 \
         "algorithm.load_ae=${STAGE1_CKPT}" \
         wandb.entity=dummy \
         wandb.mode=disabled \
-        "+name=pusht_stage2_${SLURM_JOB_ID}"
+        "+name=manifeel_stage2_${SLURM_JOB_ID}"
 
 else
     echo "ERROR: unknown stage '$STAGE'. Use 'stage1' or 'stage2'."

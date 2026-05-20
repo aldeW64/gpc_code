@@ -1,0 +1,28 @@
+dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
+models_save_dir: saved_checkpoints_phase1
+
+# Training hyperparameters
+num_epochs: 100
+# Phase 1: obs_horizon=4, pred_horizon=5 → seq_length = 1 (single-step warmup).
+obs_horizon: 4
+pred_horizon: 5
+batch_size: 8
+resize_scale: 96
+lr: 1.0e-4
+save_every: 1
+
+# Logging
+wandb: false
+
+# Late Fusion loss balance
+loss_alpha: 0.5
+composition_weights: [0.7, 0.3]
+
+# Phase 1 starts from scratch.
+phase_one_checkpoint: null
+
+# UNet architecture (shared by both RGB and tactile experts)
+cond_channels: 256
+depths: [2, 2, 2, 2]
+channels: [96, 96, 96, 96]
+attn_depths: [0, 0, 1, 1]

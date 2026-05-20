@@ -5,7 +5,7 @@
 # Data
 # --------------------------------------------------------------------------
 dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel/data
-models_save_dir: saved_checkpoints
+models_save_dir: saved_checkpoints_phase2
 
 # --------------------------------------------------------------------------
 # Training
@@ -15,14 +15,14 @@ batch_size: 8
 lr: 1.0e-4
 wandb: false
 
-# --------------------------------------------------------------------------
-# Sequence horizons
-# --------------------------------------------------------------------------
-# obs_horizon  : number of past frames fed as conditioning context
-# pred_horizon : number of autoregressive future steps trained per sequence
-# Window size  = obs_horizon + pred_horizon + 1 frames total
+# Phase 2: obs_horizon=4, pred_horizon=8 → seq_length = 4 (multi-step autoregressive).
+# Run config_phase1.yml first (pred_horizon=5, seq_length=1) for single-step warmup.
 obs_horizon: 4
 pred_horizon: 8
+
+# Phase 2: path to the final Phase-1 checkpoint (denoiser.pth inside dict).
+# Set to null to train from scratch (not recommended).
+phase_one_checkpoint: saved_checkpoints_phase1/checkpoint_epoch_100/denoiser.pth
 
 # --------------------------------------------------------------------------
 # Image preprocessing

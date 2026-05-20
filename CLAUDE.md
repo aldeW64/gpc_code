@@ -184,10 +184,30 @@ The `LinearNormalizer` (images `[0,1]→[-1,1]`, actions `[0,511]→[-1,1]`) is 
 |------|---------|
 | `interactive_world_sim/interactive_world_sim/datasets/latent_dynamics/pusht_zarr_dataset.py` | `PushTZarrDataset` — reads PushT zarr via `ReplayBuffer`, emits `obs: {image: (T,3,H,W)}` + `action: (T,2)` |
 | `interactive_world_sim/configurations/dataset/pusht_dataset.yaml` | Hydra dataset config: `domain18.zarr`, `resolution=96`, `action_dim=2`, `obs_keys=[image]` |
+| `interactive_world_sim/interactive_world_sim/datasets/latent_dynamics/manifeel_zarr_dataset.py` | `ManiFEELZarrDataset` — reads ManiFEEL zarr (all tasks), front camera as `"image"`, 7-DOF actions |
+| `interactive_world_sim/configurations/dataset/manifeel_dataset.yaml` | Hydra dataset config: ManiFEEL data dir, `resolution=96`, `action_dim=7`, `obs_keys=[image]` |
+| `interactive_world_sim/interactive_world_sim/datasets/latent_dynamics/manifeel_multimodal_dataset.py` | `ManiFEELMultimodalDataset` — loads both `data/front` and `data/left_tactile_camera_taxim`, emits `obs: {rgb, tactile}` |
+| `interactive_world_sim/configurations/dataset/manifeel_multimodal_dataset.yaml` | Hydra dataset config: ManiFEEL multimodal, `obs_keys=[rgb, tactile]` |
+| `interactive_world_sim/interactive_world_sim/algorithms/latent_dynamics/latent_world_model_early_fusion.py` | `LatentWorldModelEarlyFusion` — 6-ch encoder (RGB+tactile concat), 6-ch decoder |
+| `interactive_world_sim/interactive_world_sim/algorithms/latent_dynamics/latent_world_model_middle_fusion.py` | `LatentWorldModelMiddleFusion` — dual encoders + `CrossModalAttention`, RGB-only decoder |
+| `interactive_world_sim/interactive_world_sim/algorithms/latent_dynamics/latent_world_model_late_fusion.py` | `LatentWorldModelLateFusion` — two independent pipelines, latent-space composition |
+| `interactive_world_sim/configurations/algorithm/latent_world_model_early_fusion.yaml` | Hydra algorithm config for early fusion |
+| `interactive_world_sim/configurations/algorithm/latent_world_model_middle_fusion.yaml` | Hydra algorithm config for middle fusion |
+| `interactive_world_sim/configurations/algorithm/latent_world_model_late_fusion.yaml` | Hydra algorithm config for late fusion |
 | `gpc_wam_evaluation/iws_adapter.py` | `IWSWorldModelAdapter.rollout_final_image()` — same interface as WAM/GPC adapters |
 | `gpc_rank_evaluation/eval_iws.py` | GPC-RANK eval loop using IWS as world model (same reward predictors as `eval_baseline.py`) |
 | `gpc_rank_evaluation/gpc_rank_evaluation_iws.py` | CLI entry point for IWS-based GPC-RANK eval |
 | `gpc_rank_evaluation/configs/gpc_rank_evaluation_iws_config.yml` | Config for IWS GPC-RANK eval |
+| `world_model_train_phase_one/dataset_manifeel.py` | `ManiFEELDataset` + `build_manifeel_dataset` factory for GPC phase-1 training |
+| `world_model_train_phase_one/diffusion/inner_model_manifeel.py` | `InnerModel` with `action_dim=7` parameter (vs hardcoded `2` for PushT) |
+| `world_model_train_phase_one/diffusion/denoiser_manifeel.py` | `Denoiser` importing from `inner_model_manifeel` (7-DOF actions) |
+| `world_model_train_phase_one/train_manifeel.py` | Phase-1 training script for ManiFEEL (single-step warmup, no checkpoint loading) |
+| `world_model_train_phase_one/configs/train_manifeel_phase_one_config.yml` | Config: `obs_horizon=4`, `pred_horizon=5`, `dataset/manifeel/data` |
+| `world_model_train_phase_two/dataset_manifeel.py` | Same as phase-one dataset (identical copy) |
+| `world_model_train_phase_two/diffusion/inner_model_manifeel.py` | Same as phase-one inner model |
+| `world_model_train_phase_two/diffusion/denoiser_manifeel.py` | Same as phase-one denoiser |
+| `world_model_train_phase_two/train_manifeel.py` | Phase-2 training script for ManiFEEL (multi-step, loads phase-1 checkpoint) |
+| `world_model_train_phase_two/configs/train_manifeel_phase_two_config.yml` | Config: `obs_horizon=4`, `pred_horizon=16`, points to phase-1 checkpoint |
 
 #### Training IWS on PushT
 
@@ -408,7 +428,12 @@ Reward signal: `reward = -MSE(predicted_final_image, goal_image)`. The goal imag
 - **IWS training (Hydra CWD)**: `@hydra.main(version_base=None)` changes the working directory to `outputs/<date>/<time>/` before your code runs. `PushTZarrDataset` uses `hydra.utils.get_original_cwd()` to resolve the relative `dataset_path` back to the original `interactive_world_sim/` launch directory. The default config uses `../dataset/...` so it resolves correctly to the repo-root zarr. If you move or rename the zarr, pass an absolute path via `dataset.dataset_path=/abs/path/to/domain18.zarr`
 - **IWS adapter (auto-detect config)**: `iws_adapter.py` walks up the checkpoint path looking for `.hydra/config.yaml`; if the checkpoint was copied out of its Hydra output tree, pass `--iws_cfg_path` explicitly
 - **IWS normalizer**: the `LinearNormalizer` is an `nn.Module` saved inside the Lightning checkpoint; if a checkpoint was saved before `set_normalizer()` was called (e.g., a pre-training stub), the adapter falls back to a hard-coded PushT action range `[0, 511]`
-- **IWS `action_dim`**: must be overridden to `2` on the command line (`algorithm.action_dim=2`) since the default config assumes ALOHA's 10-DoF actions
+- **IWS `action_dim`**: must be overridden on the command line — use `algorithm.action_dim=2` for PushT, `algorithm.action_dim=7` for ManiFEEL; the default config assumes ALOHA's 10-DoF actions
+- **GPC ManiFEEL dataset**: ManiFEEL zarr arrays live under a `data/` group (not root). Keys are `store["data"]["front"]` (float32 HWC [0,1]), `store["data"]["action"]` (7-DOF float32), `store["meta"]["episode_ends"]`. Task directories have no `.zarr` extension — do not filter by extension.
+- **GPC ManiFEEL inner_model**: `train_manifeel.py` sets `num_steps_conditioning=obs_horizon` (so the act_emb linear maps `(B, n, 7) → (B, cond_channels)`). Phase 1 config uses `obs_horizon=4, pred_horizon=5` → `seq_length=1` (true single-step warmup). Phase 2 uses `pred_horizon=16` → `seq_length=12`.
+- **IWS multimodal early fusion**: `x_shape=[6,H,W]` in the algorithm YAML; encoder `in_channels=6` automatically. Loss is MSE over all 6 channels (RGB + tactile next frame combined).
+- **IWS multimodal middle fusion**: `CrossModalAttention` zero-initialises its output projections so it starts as identity — training is numerically stable from step 1. Only RGB is decoded at inference.
+- **IWS multimodal late fusion**: Stage 1 loss = `alpha * loss_rgb + (1-alpha) * loss_tac`. At inference, latents are composed before decoding: `z = w_rgb * z_rgb + w_tac * z_tac` (defaults `[0.7, 0.3]`).
 
 ## Multimodal World Model (`world_model_multimodal/`)
 
@@ -426,23 +451,27 @@ Zarr structure (one store per task under `dataset/manifeel/data/<task>/`):
 
 ### Training Commands
 
-All three scripts must be run from **within their respective directories** (configs use relative paths):
+All three scripts follow the same **two-phase strategy** as the base GPC world model:
+- **Phase 1** (`config_phase1.yml`): `pred_horizon=5` → `seq_length=1` (single-step warmup)
+- **Phase 2** (`config.yml`): `pred_horizon=8` → `seq_length=4` (multi-step autoregressive, init from Phase 1)
+
+Run from **within their respective directories** (configs use relative paths):
 
 ```bash
-# Early Fusion — concatenate RGB + tactile as 6-channel input before the first conv
-cd world_model_multimodal/early_fusion
-python train.py --config configs/config.yml
+# --- Phase 1: single-step warmup ---
+cd world_model_multimodal/early_fusion  && python train.py --config configs/config_phase1.yml
+cd world_model_multimodal/middle_fusion && python train.py --config configs/config_phase1.yml
+cd world_model_multimodal/late_fusion   && python train.py --config configs/config_phase1.yml
 
-# Middle Fusion — dual UNet encoders + cross-modal attention at the bottleneck
-cd world_model_multimodal/middle_fusion
-python train.py --config configs/config.yml
-
-# Late Fusion — two independent experts (RGB and tactile), scores composed at inference
-cd world_model_multimodal/late_fusion
-python train.py --config configs/config.yml
+# --- Phase 2: multi-step (after Phase 1 completes) ---
+# config.yml reads phase_one_checkpoint: saved_checkpoints_phase1/checkpoint_epoch_100/denoiser.pth
+cd world_model_multimodal/early_fusion  && python train.py --config configs/config.yml
+cd world_model_multimodal/middle_fusion && python train.py --config configs/config.yml
+cd world_model_multimodal/late_fusion   && python train.py --config configs/config.yml
 ```
 
-Checkpoints are saved to `saved_checkpoints/checkpoint_epoch_N/` inside each fusion directory.
+Phase 1 checkpoints → `saved_checkpoints_phase1/checkpoint_epoch_N/`
+Phase 2 checkpoints → `saved_checkpoints_phase2/checkpoint_epoch_N/`
 
 ### Architecture Summary
 

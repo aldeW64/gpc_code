@@ -5,18 +5,15 @@
 dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel/data
 
 # Output
-models_save_dir: saved_checkpoints
+models_save_dir: saved_checkpoints_phase2
 
 # Training
 num_epochs: 100
 batch_size: 8
 lr: 1.0e-4
 
-# Observation / prediction horizons
-# obs_horizon: number of past fused frames fed as context to the model
-# pred_horizon: number of future steps the model is trained to predict
-#   (the Denoiser iterates autoregressively over pred_horizon steps per batch)
-# window_size = obs_horizon + pred_horizon
+# Phase 2: obs_horizon=4, pred_horizon=8 → seq_length = 4 (multi-step autoregressive).
+# Run config_phase1.yml first (pred_horizon=5, seq_length=1) for single-step warmup.
 obs_horizon: 4
 pred_horizon: 8
 
@@ -26,6 +23,9 @@ resize_scale: 96
 # Logging — set to true to enable Weights & Biases logging
 wandb: false
 
-# Optional: path to a checkpoint directory to resume training from.
-# Set to null (or omit) to start from scratch.
+# Phase 2: path to the final Phase-1 checkpoint (denoiser.pth).
+# Set to null to train from scratch (not recommended).
+phase_one_checkpoint: saved_checkpoints_phase1/checkpoint_epoch_100/denoiser.pth
+
+# Optional: path to a checkpoint directory to resume a mid-run Phase-2 training.
 resume_checkpoint: null

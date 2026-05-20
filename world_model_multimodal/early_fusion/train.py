@@ -88,6 +88,7 @@ def main() -> None:
     lr: float = config["lr"]
     use_wandb: bool = config.get("wandb", False)
     resume_checkpoint: Optional[str] = config.get("resume_checkpoint", None)
+    phase_one_checkpoint: Optional[str] = config.get("phase_one_checkpoint", None)
 
     print(f"Device: {device}")
     print(f"Config: {config}")
@@ -164,8 +165,16 @@ def main() -> None:
     nets = nets.to(device)
     nets["denoiser"].setup_training(sigma_dist_cfg)
 
-    # ---- optional resume ----
-    if resume_checkpoint is not None:
+    # ---- Phase 2: load Phase-1 weights before multi-step training ----
+    if phase_one_checkpoint is not None:
+        state = torch.load(phase_one_checkpoint, map_location=device)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        nets["denoiser"].load_state_dict(state)
+        print(f"Loaded phase-1 checkpoint: {phase_one_checkpoint}")
+
+    # ---- optional mid-run resume (restores optimizer state too) ----
+    elif resume_checkpoint is not None:
         ckpt_path = os.path.join(resume_checkpoint, "denoiser.pth")
         if os.path.exists(ckpt_path):
             state = torch.load(ckpt_path, map_location=device)

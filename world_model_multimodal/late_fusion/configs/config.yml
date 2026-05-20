@@ -1,10 +1,12 @@
 dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
-models_save_dir: saved_checkpoints
+models_save_dir: saved_checkpoints_phase2
 
 # Training hyperparameters
 num_epochs: 100
-obs_horizon: 4        # number of past frames fed as conditioning (num_steps_conditioning)
-pred_horizon: 8       # number of future RGB frames predicted per window (autoregressive steps)
+# Phase 2: obs_horizon=4, pred_horizon=8 → seq_length = 4 (multi-step autoregressive).
+# Run config_phase1.yml first (pred_horizon=5, seq_length=1) for single-step warmup.
+obs_horizon: 4
+pred_horizon: 8
 batch_size: 8
 resize_scale: 96      # both RGB and tactile frames are resized to (96 x 96)
 lr: 1.0e-4
@@ -12,6 +14,10 @@ save_every: 1         # save a checkpoint every N epochs
 
 # Logging
 wandb: false
+
+# Phase 2: path to the final Phase-1 checkpoint (late_fusion_denoiser.pth).
+# Set to null to train from scratch (not recommended).
+phase_one_checkpoint: saved_checkpoints_phase1/checkpoint_epoch_100/late_fusion_denoiser.pth
 
 # Late Fusion loss balance
 # loss = loss_alpha * MSE(eps_rgb, target) + (1 - loss_alpha) * MSE(eps_tac, target)

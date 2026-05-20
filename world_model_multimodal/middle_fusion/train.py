@@ -193,9 +193,15 @@ def main() -> None:
     # ---- Optimizer ---------------------------------------------------------
     optimizer = torch.optim.AdamW(denoiser.parameters(), lr=lr)
 
-    # ---- Resume from checkpoint -------------------------------------------
+    # ---- Phase 2: load Phase-1 weights (fresh optimizer, new pred_horizon) ----
     start_epoch = 0
-    if args.resume is not None:
+    phase_one_ckpt = config.get("phase_one_checkpoint", None)
+    if phase_one_ckpt is not None:
+        raw = torch.load(phase_one_ckpt, map_location=device)
+        state = raw.get("model_state_dict", raw)
+        denoiser.load_state_dict(state)
+        print(f"Loaded phase-1 checkpoint: {phase_one_ckpt}")
+    elif args.resume is not None:
         start_epoch = load_checkpoint(args.resume, denoiser, optimizer, device)
         print(f"Resumed from epoch {start_epoch}")
 

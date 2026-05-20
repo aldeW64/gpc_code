@@ -156,6 +156,14 @@ def main() -> None:
     # ---- Optimizer ----
     optimizer = torch.optim.AdamW(denoiser.parameters(), lr=lr)
 
+    # ---- Phase 2: load Phase-1 weights (fresh optimizer, new pred_horizon) ----
+    phase_one_ckpt = config.get('phase_one_checkpoint', None)
+    if phase_one_ckpt is not None:
+        raw = torch.load(phase_one_ckpt, map_location=device)
+        state = raw.get('model_state_dict', raw)
+        denoiser.load_state_dict(state)
+        print(f'[train] Loaded phase-1 checkpoint: {phase_one_ckpt}')
+
     os.makedirs(models_save_dir, exist_ok=True)
 
     # ---- Training loop ----
