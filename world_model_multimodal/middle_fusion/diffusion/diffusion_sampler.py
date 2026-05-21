@@ -2,17 +2,9 @@
 diffusion_sampler.py — Stochastic sampler (Karras et al. 2022) for the
 middle-fusion dual-stream denoiser.
 
-The sampler implements the Euler (order=1) and Heun (order=2) ODE solvers
-with optional stochastic noise injection controlled by s_churn.
-
-Usage::
-
-    sampler = DiffusionSampler(denoiser, cfg)
-    pred_rgb, trajectory = sampler.sample(prev_rgb, prev_tactile, prev_act)
-
-Both ``prev_rgb`` and ``prev_tactile`` are expected as (B, n, 3, H, W)
-tensors (n = num_steps_conditioning past frames).  The sampler reshapes them
-to (B, n*3, H, W) before passing to the denoiser.
+Both RGB and tactile are prediction targets, so the sampler maintains two
+parallel ODE trajectories (x_rgb, x_tac) that are denoised jointly at every
+step via the dual-stream inner model.
 """
 
 from dataclasses import dataclass, field
@@ -22,11 +14,6 @@ import torch
 from torch import Tensor
 
 from diffusion.denoiser import Denoiser
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -43,11 +30,6 @@ class DiffusionSamplerConfig:
     s_cond: float = 0.0     # if > 0, add this noise level to the conditioning frames
 
 
-# ---------------------------------------------------------------------------
-# Sigma schedule
-# ---------------------------------------------------------------------------
-
-
 def build_sigmas(
     num_steps: int,
     sigma_min: float,
@@ -62,18 +44,12 @@ def build_sigmas(
     return torch.cat([sigmas, sigmas.new_zeros(1)])
 
 
-# ---------------------------------------------------------------------------
-# Sampler
-# ---------------------------------------------------------------------------
-
-
 class DiffusionSampler:
     """
     Karras-style ODE sampler for the middle-fusion denoiser.
 
-    Args:
-        denoiser: trained Denoiser instance
-        cfg: DiffusionSamplerConfig
+    Maintains two parallel noise trajectories (x_rgb, x_tac) that are
+    denoised jointly. Returns both predicted next frames.
     """
 
     def __init__(self, denoiser: Denoiser, cfg: DiffusionSamplerConfig) -> None:
@@ -93,81 +69,80 @@ class DiffusionSampler:
         prev_rgb: Tensor,      # (B, n, 3, H, W)  past RGB frames
         prev_tactile: Tensor,  # (B, n, 3, H, W)  past tactile frames
         prev_act: Tensor,      # (B, n, 7)         past actions
-    ) -> Tuple[Tensor, List[Tensor]]:
+    ) -> Tuple[Tuple[Tensor, Tensor], List[Tensor]]:
         """
-        Denoise from pure Gaussian noise to a predicted next RGB frame.
+        Jointly denoise from pure Gaussian noise to predicted next RGB and tactile frames.
 
         Returns:
-            x         : (B, 3, H, W) denoised RGB prediction
-            trajectory: list of intermediate tensors (one per denoising step)
+            (x_rgb, x_tac) : each (B, 3, H, W) — denoised predictions
+            trajectory     : list of intermediate x_rgb tensors (one per step)
         """
         device = prev_rgb.device
         b, n, c, h, w = prev_rgb.shape
 
-        # Flatten temporal dimension into channels
         prev_rgb_flat = prev_rgb.reshape(b, n * c, h, w)
         prev_tac_flat = prev_tactile.reshape(b, n * c, h, w)
 
         s_in = torch.ones(b, device=device)
-        gamma_ = min(
-            self.cfg.s_churn / (len(self.sigmas) - 1), 2 ** 0.5 - 1
-        )
+        gamma_ = min(self.cfg.s_churn / (len(self.sigmas) - 1), 2 ** 0.5 - 1)
 
-        # Start from pure Gaussian noise
-        x = torch.randn(b, c, h, w, device=device)
-        trajectory: List[Tensor] = [x]
+        # Start both trajectories from independent Gaussian noise
+        x_rgb = torch.randn(b, c, h, w, device=device)
+        x_tac = torch.randn(b, c, h, w, device=device)
+        trajectory: List[Tensor] = [x_rgb]
 
-        prev_rgb_noised = prev_rgb_flat  # will be overwritten if s_cond > 0
+        prev_rgb_cond = prev_rgb_flat
+        prev_tac_cond = prev_tac_flat
 
         for sigma, next_sigma in zip(self.sigmas[:-1], self.sigmas[1:]):
             gamma = gamma_ if self.cfg.s_tmin <= sigma <= self.cfg.s_tmax else 0.0
             sigma_hat = sigma * (1 + gamma)
 
-            # Stochastic noise injection
             if gamma > 0:
-                eps = torch.randn_like(x) * self.cfg.s_noise
-                x = x + eps * (sigma_hat ** 2 - sigma ** 2) ** 0.5
+                x_rgb = x_rgb + torch.randn_like(x_rgb) * self.cfg.s_noise * (sigma_hat ** 2 - sigma ** 2) ** 0.5
+                x_tac = x_tac + torch.randn_like(x_tac) * self.cfg.s_noise * (sigma_hat ** 2 - sigma ** 2) ** 0.5
 
-            # Optionally noise the conditioning frames
             if self.cfg.s_cond > 0:
                 sigma_cond = torch.full((b,), self.cfg.s_cond, device=device)
-                prev_rgb_noised = self.denoiser.apply_noise(
-                    prev_rgb_flat, sigma_cond, sigma_offset_noise=0.0
-                )
+                prev_rgb_cond = self.denoiser.apply_noise(prev_rgb_flat, sigma_cond, 0.0)
+                prev_tac_cond = self.denoiser.apply_noise(prev_tac_flat, sigma_cond, 0.0)
                 sigma_cond_arg: Optional[Tensor] = sigma_cond
             else:
                 sigma_cond_arg = None
 
-            denoised = self.denoiser.denoise(
-                x,
+            denoised_rgb, denoised_tac = self.denoiser.denoise(
+                x_rgb, x_tac,
                 sigma_hat * s_in,
                 sigma_cond_arg,
-                prev_rgb_noised,
-                prev_tac_flat,
+                prev_rgb_cond,
+                prev_tac_cond,
                 prev_act,
             )
 
-            d = (x - denoised) / sigma_hat
+            d_rgb = (x_rgb - denoised_rgb) / sigma_hat
+            d_tac = (x_tac - denoised_tac) / sigma_hat
             dt = next_sigma - sigma_hat
 
             if self.cfg.order == 1 or next_sigma == 0:
-                # Euler step
-                x = x + d * dt
+                x_rgb = x_rgb + d_rgb * dt
+                x_tac = x_tac + d_tac * dt
             else:
-                # Heun's method (second-order correction)
-                x_2 = x + d * dt
-                denoised_2 = self.denoiser.denoise(
-                    x_2,
+                # Heun's second-order correction
+                x_rgb_2 = x_rgb + d_rgb * dt
+                x_tac_2 = x_tac + d_tac * dt
+                denoised_rgb_2, denoised_tac_2 = self.denoiser.denoise(
+                    x_rgb_2, x_tac_2,
                     next_sigma * s_in,
                     sigma_cond_arg,
-                    prev_rgb_noised,
-                    prev_tac_flat,
+                    prev_rgb_cond,
+                    prev_tac_cond,
                     prev_act,
                 )
-                d_2 = (x_2 - denoised_2) / next_sigma
-                d_prime = (d + d_2) / 2
-                x = x + d_prime * dt
+                d_rgb_2 = (x_rgb_2 - denoised_rgb_2) / next_sigma
+                d_tac_2 = (x_tac_2 - denoised_tac_2) / next_sigma
+                x_rgb = x_rgb + (d_rgb + d_rgb_2) / 2 * dt
+                x_tac = x_tac + (d_tac + d_tac_2) / 2 * dt
 
-            trajectory.append(x)
+            trajectory.append(x_rgb)
 
-        return x, trajectory
+        return (x_rgb, x_tac), trajectory

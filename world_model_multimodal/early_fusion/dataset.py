@@ -156,7 +156,13 @@ class ManifEELEpisodeDataset(Dataset):
         episode_ends = store["meta"]["episode_ends"][:]  # (num_episodes,) int64
 
         # ---- actions ----
-        action_raw = store["data"]["action"][:]  # (N, 7) float32
+        action_raw = store["data"]["action"][:]  # (N, 6 or 7) float32
+        # Some ManiFEEL tasks have 6-DOF actions; pad to 7-DOF to match the model
+        if action_raw.shape[1] < 7:
+            action_raw = np.concatenate(
+                [action_raw, np.zeros((len(action_raw), 7 - action_raw.shape[1]), dtype=np.float32)],
+                axis=1,
+            )
 
         # Compute or use provided action normalization statistics
         if action_stats is None:

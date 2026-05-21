@@ -123,7 +123,13 @@ class ManifEELDataset(Dataset):
         # Read array metadata only (lazy load)
         self._front_arr = data['front']              # (N, 256, 256, 3) float32
         self._tac_arr = data['left_tactile_camera_taxim']  # (N, 320, 240, 3) float32
-        action_raw = data['action'][:]               # (N, 7) float32  — load fully
+        action_raw = data['action'][:]               # (N, 6 or 7) float32  — load fully
+        # Some ManiFEEL tasks have 6-DOF actions; pad to 7-DOF to match the model
+        if action_raw.shape[1] < 7:
+            action_raw = np.concatenate(
+                [action_raw, np.zeros((len(action_raw), 7 - action_raw.shape[1]), dtype=np.float32)],
+                axis=1,
+            )
 
         episode_ends = meta['episode_ends'][:]       # (E,) int64
 

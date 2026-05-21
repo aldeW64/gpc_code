@@ -57,9 +57,12 @@ def _resize_image(img: np.ndarray, size: int) -> np.ndarray:
     return t.squeeze(0).permute(1, 2, 0).numpy()
 
 
-def _compute_action_stats(zarr_root: zarr.Group) -> Tuple[np.ndarray, np.ndarray]:
-    """Return per-dimension min and max of the action array."""
+def _compute_action_stats(zarr_root: zarr.Group, expected_dim: int = 7) -> Tuple[np.ndarray, np.ndarray]:
+    """Return per-dimension min and max of the action array, padded to expected_dim."""
     action = zarr_root["data"]["action"][:]
+    if action.shape[1] < expected_dim:
+        pad = np.zeros((len(action), expected_dim - action.shape[1]), dtype=np.float32)
+        action = np.concatenate([action, pad], axis=1)
     return action.min(axis=0), action.max(axis=0)
 
 
@@ -151,7 +154,12 @@ class ManiFEELZarrTaskDataset(Dataset):
         # Load raw arrays from zarr (returns numpy)
         front_raw = self._front[start:end]     # (T, 256, 256, 3) float32 [0,1]
         tactile_raw = self._tactile[start:end]  # (T, 320, 240, 3) float32 [0,1]
-        action_raw = self._action[start:end]    # (T, 7)           float32
+        action_raw = self._action[start:end]    # (T, 6 or 7) float32
+        if action_raw.shape[1] < 7:
+            action_raw = np.concatenate(
+                [action_raw, np.zeros((len(action_raw), 7 - action_raw.shape[1]), dtype=np.float32)],
+                axis=1,
+            )
 
         T = self.window_size
         H = W = self.resize_scale

@@ -142,8 +142,12 @@ def _resize_images(images: np.ndarray, target_size: int) -> np.ndarray:
 def _build_multimodal_replay_buffer(
     dataset_path: str,
     resolution: int,
+    action_dim: int = 7,
 ) -> ReplayBuffer:
     """Scan *dataset_path* for zarr task directories and concatenate both modalities.
+
+    Tasks whose action array has a different number of columns than *action_dim*
+    are silently skipped (ManiFEEL mixes 6-DOF and 7-DOF tasks).
 
     Returns a ReplayBuffer with keys ``"rgb"``, ``"tactile"``, and ``"action"``.
     """
@@ -181,6 +185,13 @@ def _build_multimodal_replay_buffer(
         tac_images: np.ndarray = store["data"][_ZARR_TACTILE_KEY][:]
         actions: np.ndarray = store["data"]["action"][:]
         episode_ends: np.ndarray = store["meta"]["episode_ends"][:]
+
+        if actions.shape[1] != action_dim:
+            print(
+                f"[ManiFEELMultimodalDataset] skipping task '{task_name}': "
+                f"action_dim={actions.shape[1]} != expected {action_dim}"
+            )
+            continue
 
         rgb_images = _resize_images(rgb_images.astype(np.float32), resolution)
         tac_images = _resize_images(tac_images.astype(np.float32), resolution)
@@ -243,6 +254,7 @@ class ManiFEELMultimodalDataset(BaseImageDataset):
         self.replay_buffer = _build_multimodal_replay_buffer(
             dataset_path=self.dataset_path,
             resolution=self.resolution,
+            action_dim=int(cfg.get("action_dim", 7)),
         )
 
         n_eps = self.replay_buffer.n_episodes

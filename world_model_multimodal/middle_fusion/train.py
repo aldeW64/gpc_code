@@ -25,6 +25,7 @@ Checkpoint format::
 
 import argparse
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List
 
@@ -63,6 +64,21 @@ def save_checkpoint(
         },
         path,
     )
+
+
+def find_latest_checkpoint(models_save_dir: str):
+    """Return (checkpoint_dir, epoch) for the highest saved epoch, or (None, 0)."""
+    if not os.path.isdir(models_save_dir):
+        return None, 0
+    pattern = re.compile(r"^checkpoint_epoch_(\d+)$")
+    best_epoch, best_dir = 0, None
+    for name in os.listdir(models_save_dir):
+        m = pattern.match(name)
+        if m:
+            epoch = int(m.group(1))
+            if epoch > best_epoch:
+                best_epoch, best_dir = epoch, os.path.join(models_save_dir, name)
+    return best_dir, best_epoch
 
 
 def load_checkpoint(
@@ -201,9 +217,16 @@ def main() -> None:
         state = raw.get("model_state_dict", raw)
         denoiser.load_state_dict(state)
         print(f"Loaded phase-1 checkpoint: {phase_one_ckpt}")
-    elif args.resume is not None:
-        start_epoch = load_checkpoint(args.resume, denoiser, optimizer, device)
-        print(f"Resumed from epoch {start_epoch}")
+    else:
+        # Auto-resume: use --resume if given, else find latest checkpoint in models_save_dir
+        resume_path = args.resume
+        if resume_path is None:
+            latest_dir, _ = find_latest_checkpoint(models_save_dir)
+            if latest_dir is not None:
+                resume_path = os.path.join(latest_dir, "denoiser.pth")
+        if resume_path is not None:
+            start_epoch = load_checkpoint(resume_path, denoiser, optimizer, device)
+            print(f"Resuming from epoch {start_epoch} ({resume_path})")
 
     # ---- Training loop -----------------------------------------------------
     os.makedirs(models_save_dir, exist_ok=True)

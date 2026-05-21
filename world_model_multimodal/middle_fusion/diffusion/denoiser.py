@@ -1,21 +1,14 @@
 """
 denoiser.py — Denoiser wrapper for the middle-fusion dual-stream world model.
 
-This follows the EDM (Karras et al. 2022) preconditioning scheme:
-  - c_in  : rescales the noisy input before feeding to the network
-  - c_skip: weight for the skip connection (identity part)
-  - c_out : weight for the network output
-  - c_noise: log(sigma)/4, the noise-level embedding fed to the network
-
-The denoiser wraps MiddleFusionInnerModel and provides:
-  - forward()            : computes training loss (MSE on denoised output vs. target)
-  - denoise()            : single denoising step for inference
-  - compute_model_output(): raw network output (without skip connection)
-  - wrap_model_output()  : applies skip + quantization
+Follows the EDM (Karras et al. 2022) preconditioning scheme. Both RGB and
+tactile are now prediction targets: each autoregressive step denoises a next
+RGB frame AND a next tactile frame jointly via the dual-stream inner model.
+The training loss is the sum of MSE over both modalities.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -76,10 +69,10 @@ class Denoiser(nn.Module):
     EDM-style denoiser for the middle-fusion dual-stream world model.
 
     Training:
-      Reads batches with keys 'front' and 'tactile' (both (B, T, 3, H, W))
-      and 'action' ((B, T, 7)).  For each autoregressive step i the model is
-      asked to denoise the (n+i)-th front frame given n past front frames,
-      n past tactile frames, and n past actions.
+      Reads batches with keys 'front' (B,T,3,H,W), 'tactile' (B,T,3,H,W),
+      and 'action' (B,T,7). For each autoregressive step the model jointly
+      denoises the next RGB frame and the next tactile frame, conditioned on
+      n past frames of both modalities plus n past actions.
 
     Inference:
       Use denoise() directly or use DiffusionSampler.
@@ -92,16 +85,10 @@ class Denoiser(nn.Module):
         self.sample_sigma_training: Optional[object] = None
 
     # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
 
     @property
     def device(self) -> torch.device:
         return next(self.inner_model.parameters()).device
-
-    # ------------------------------------------------------------------
-    # Training setup
-    # ------------------------------------------------------------------
 
     def setup_training(self, cfg: SigmaDistributionConfig) -> None:
         assert self.sample_sigma_training is None, "setup_training called twice"
@@ -116,9 +103,7 @@ class Denoiser(nn.Module):
     # EDM preconditioning helpers
     # ------------------------------------------------------------------
 
-    def apply_noise(
-        self, x: Tensor, sigma: Tensor, sigma_offset_noise: float
-    ) -> Tensor:
+    def apply_noise(self, x: Tensor, sigma: Tensor, sigma_offset_noise: float) -> Tensor:
         b, c, _, _ = x.shape
         offset_noise = sigma_offset_noise * torch.randn(b, c, 1, 1, device=x.device)
         return x + offset_noise + torch.randn_like(x) * add_dims(sigma, x.ndim)
@@ -148,28 +133,27 @@ class Denoiser(nn.Module):
     def compute_model_output(
         self,
         noisy_next_rgb: Tensor,   # (B, 3, H, W)
+        noisy_next_tac: Tensor,   # (B, 3, H, W)
         prev_rgb: Tensor,          # (B, n*3, H, W)
         prev_tactile: Tensor,      # (B, n*3, H, W)
         act: Tensor,               # (B, n, 7)
         cs: Conditioners,
-    ) -> Tensor:
-        rescaled_rgb = prev_rgb / self.cfg.sigma_data
-        rescaled_noise = noisy_next_rgb * cs.c_in
+    ) -> Tuple[Tensor, Tensor]:
         return self.inner_model(
-            rescaled_noise,
+            noisy_next_rgb * cs.c_in,
+            noisy_next_tac * cs.c_in,
             cs.c_noise,
             cs.c_noise_cond,
-            rescaled_rgb,
+            prev_rgb / self.cfg.sigma_data,
             prev_tactile / self.cfg.sigma_data,
             act,
         )
 
     @torch.no_grad()
     def wrap_model_output(
-        self, noisy_next_rgb: Tensor, model_output: Tensor, cs: Conditioners
+        self, noisy: Tensor, model_output: Tensor, cs: Conditioners
     ) -> Tensor:
-        d = cs.c_skip * noisy_next_rgb + cs.c_out * model_output
-        # Quantise to {0, ..., 255} then map back to [-1, 1]
+        d = cs.c_skip * noisy + cs.c_out * model_output
         d = d.clamp(-1, 1).add(1).div(2).mul(255).byte().div(255).mul(2).sub(1)
         return d
 
@@ -177,17 +161,21 @@ class Denoiser(nn.Module):
     def denoise(
         self,
         noisy_next_rgb: Tensor,
+        noisy_next_tac: Tensor,
         sigma: Tensor,
         sigma_cond: Optional[Tensor],
         prev_rgb: Tensor,
         prev_tactile: Tensor,
         act: Tensor,
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Tensor]:
         cs = self.compute_conditioners(sigma, sigma_cond)
-        model_output = self.compute_model_output(
-            noisy_next_rgb, prev_rgb, prev_tactile, act, cs
+        out_rgb, out_tac = self.compute_model_output(
+            noisy_next_rgb, noisy_next_tac, prev_rgb, prev_tactile, act, cs
         )
-        return self.wrap_model_output(noisy_next_rgb, model_output, cs)
+        return (
+            self.wrap_model_output(noisy_next_rgb, out_rgb, cs),
+            self.wrap_model_output(noisy_next_tac, out_tac, cs),
+        )
 
     # ------------------------------------------------------------------
     # Training forward pass
@@ -195,18 +183,17 @@ class Denoiser(nn.Module):
 
     def forward(self, batch: dict, device: torch.device):
         """
-        Compute autoregressive training loss.
+        Autoregressive training loss over both RGB and tactile modalities.
 
         batch keys:
           'front'   : (B, T, 3, H, W)  float32 in [-1, 1]
           'tactile' : (B, T, 3, H, W)  float32 in [-1, 1]
           'action'  : (B, T, 7)        float32 normalised
 
-        For each autoregressive step i in [0, seq_length):
-          prev_rgb     = all_front[:, i : n+i]          — n past RGB frames
-          prev_tactile = all_tactile[:, i : n+i]        — n past tactile frames
-          prev_act     = action[:, i : n+i]             — n past actions
-          target       = all_front[:, n+i]              — next RGB frame to predict
+        For each step i in [0, seq_length):
+          Denoises front[:, n+i] and tactile[:, n+i] jointly, conditioned on
+          past n frames of both modalities. Both buffers are updated with the
+          model's own predictions for subsequent steps.
         """
         front = batch["front"].to(device)     # (B, T, 3, H, W)
         tactile = batch["tactile"].to(device)  # (B, T, 3, H, W)
@@ -214,44 +201,47 @@ class Denoiser(nn.Module):
 
         b, t, c, h, w = front.shape
         n = self.cfg.inner_model.num_steps_conditioning
-        seq_length = t - n  # number of autoregressive prediction steps
+        seq_length = t - n
 
         all_front = front.clone()
-        # Tactile is used read-only (we only predict RGB)
-        all_tactile = tactile
+        all_tactile = tactile.clone()  # both buffers roll out autoregressively
 
         loss = torch.tensor(0.0, device=device)
 
         for i in range(seq_length):
-            # Build context windows
             prev_rgb = all_front[:, i : n + i].reshape(b, n * c, h, w)
             prev_tac = all_tactile[:, i : n + i].reshape(b, n * c, h, w)
-            prev_act = act[:, i : n + i]           # (B, n, 7)
-            target_rgb = all_front[:, n + i]        # (B, 3, H, W)
+            prev_act = act[:, i : n + i]
+            target_rgb = all_front[:, n + i]
+            target_tac = all_tactile[:, n + i]
 
-            # Optionally add noise to the conditioning frames
+            # Noise both conditioning streams consistently
             if self.cfg.noise_previous_obs:
                 sigma_cond = self.sample_sigma_training(b, device)
                 prev_rgb = self.apply_noise(prev_rgb, sigma_cond, self.cfg.sigma_offset_noise)
+                prev_tac = self.apply_noise(prev_tac, sigma_cond, self.cfg.sigma_offset_noise)
             else:
                 sigma_cond = None
 
-            # Sample noise level and corrupt the target
+            # Sample one noise level and corrupt both targets
             sigma = self.sample_sigma_training(b, device)
             noisy_rgb = self.apply_noise(target_rgb, sigma, self.cfg.sigma_offset_noise)
+            noisy_tac = self.apply_noise(target_tac, sigma, self.cfg.sigma_offset_noise)
 
             cs = self.compute_conditioners(sigma, sigma_cond)
-            model_output = self.compute_model_output(
-                noisy_rgb, prev_rgb, prev_tac, prev_act, cs
+            out_rgb, out_tac = self.compute_model_output(
+                noisy_rgb, noisy_tac, prev_rgb, prev_tac, prev_act, cs
             )
 
-            # EDM training target
-            target = (target_rgb - cs.c_skip * noisy_rgb) / cs.c_out
-            loss = loss + F.mse_loss(model_output, target)
+            target_rgb_edm = (target_rgb - cs.c_skip * noisy_rgb) / cs.c_out
+            target_tac_edm = (target_tac - cs.c_skip * noisy_tac) / cs.c_out
+            loss = loss + F.mse_loss(out_rgb, target_rgb_edm) + F.mse_loss(out_tac, target_tac_edm)
 
-            # Feed the denoised prediction back for the next autoregressive step
-            denoised = self.wrap_model_output(noisy_rgb, model_output, cs)
-            all_front[:, n + i] = denoised
+            with torch.no_grad():
+                denoised_rgb = self.wrap_model_output(noisy_rgb, out_rgb, cs)
+                denoised_tac = self.wrap_model_output(noisy_tac, out_tac, cs)
+            all_front[:, n + i] = denoised_rgb.detach()
+            all_tactile[:, n + i] = denoised_tac.detach()
 
         loss = loss / seq_length
         return loss, {"loss_denoising": loss.item()}

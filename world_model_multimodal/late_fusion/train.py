@@ -13,6 +13,7 @@ The script:
 
 import argparse
 import os
+import re
 
 import numpy as np
 import torch
@@ -42,10 +43,38 @@ from diffusion.diffusion_sampler import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model: nn.Module, checkpoint_dir: str, name: str = "late_fusion_denoiser") -> None:
+def find_latest_checkpoint(models_save_dir: str):
+    """Return (checkpoint_dir, epoch) for the highest saved epoch, or (None, 0)."""
+    if not os.path.isdir(models_save_dir):
+        return None, 0
+    pattern = re.compile(r"^checkpoint_epoch_(\d+)$")
+    best_epoch, best_dir = 0, None
+    for name in os.listdir(models_save_dir):
+        m = pattern.match(name)
+        if m:
+            epoch = int(m.group(1))
+            if epoch > best_epoch:
+                best_epoch, best_dir = epoch, os.path.join(models_save_dir, name)
+    return best_dir, best_epoch
+
+
+def save_checkpoint(
+    epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: str,
+    name: str = "late_fusion_denoiser",
+) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     path = os.path.join(checkpoint_dir, f"{name}.pth")
-    torch.save(model.state_dict(), path)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        path,
+    )
     print(f"[train] Checkpoint saved: {path}")
 
 
@@ -80,7 +109,6 @@ def main() -> None:
     lr = config.get('lr', 1e-4)
     use_wandb = config.get('wandb', False)
     loss_alpha = config.get('loss_alpha', 0.5)
-    composition_weights = config.get('composition_weights', [0.7, 0.3])
     cond_channels = config.get('cond_channels', 256)
     depths = config.get('depths', [2, 2, 2, 2])
     channels = config.get('channels', [96, 96, 96, 96])
@@ -137,7 +165,6 @@ def main() -> None:
         sigma_offset_noise=0.1,
         noise_previous_obs=True,
         loss_alpha=loss_alpha,
-        composition_weights=composition_weights,
     )
 
     denoiser = LateFusionDenoiser(denoiser_cfg).to(device)
@@ -157,18 +184,33 @@ def main() -> None:
     optimizer = torch.optim.AdamW(denoiser.parameters(), lr=lr)
 
     # ---- Phase 2: load Phase-1 weights (fresh optimizer, new pred_horizon) ----
+    start_epoch = 0
     phase_one_ckpt = config.get('phase_one_checkpoint', None)
     if phase_one_ckpt is not None:
         raw = torch.load(phase_one_ckpt, map_location=device)
-        state = raw.get('model_state_dict', raw)
+        state = raw.get('model_state_dict', raw) if isinstance(raw, dict) else raw
         denoiser.load_state_dict(state)
         print(f'[train] Loaded phase-1 checkpoint: {phase_one_ckpt}')
+    else:
+        # Auto-resume: find the latest checkpoint in models_save_dir
+        latest_dir, latest_epoch = find_latest_checkpoint(models_save_dir)
+        if latest_dir is not None:
+            ckpt_path = os.path.join(latest_dir, 'late_fusion_denoiser.pth')
+            raw = torch.load(ckpt_path, map_location=device)
+            if isinstance(raw, dict) and 'model_state_dict' in raw:
+                denoiser.load_state_dict(raw['model_state_dict'])
+                optimizer.load_state_dict(raw['optimizer_state_dict'])
+                start_epoch = raw.get('epoch', latest_epoch)
+            else:
+                denoiser.load_state_dict(raw)
+                start_epoch = latest_epoch
+            print(f'[train] Resuming from epoch {start_epoch} ({latest_dir})')
 
     os.makedirs(models_save_dir, exist_ok=True)
 
     # ---- Training loop ----
     global_step = 0
-    with tqdm(range(1, num_epochs + 1), desc='Epoch') as tglobal:
+    with tqdm(range(start_epoch + 1, num_epochs + 1), desc='Epoch') as tglobal:
         for epoch_idx in tglobal:
             if use_wandb:
                 wandb.log({'epoch': epoch_idx})
@@ -228,10 +270,10 @@ def main() -> None:
             # ---- Save checkpoint ----
             if epoch_idx % save_every == 0:
                 checkpoint_dir = os.path.join(models_save_dir, f'checkpoint_epoch_{epoch_idx}')
-                save_checkpoint(denoiser, checkpoint_dir)
+                save_checkpoint(epoch_idx, denoiser, optimizer, checkpoint_dir)
 
     # Save final checkpoint
-    save_checkpoint(denoiser, os.path.join(models_save_dir, 'checkpoint_final'))
+    save_checkpoint(num_epochs, denoiser, optimizer, os.path.join(models_save_dir, 'checkpoint_final'))
     print("[train] Training complete.")
 
 

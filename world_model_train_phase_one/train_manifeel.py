@@ -62,6 +62,12 @@ def main():
         default='./configs/train_manifeel_phase_one_config.yml',
         help='Path to the configuration YAML file.',
     )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='Path to a denoiser.pth checkpoint to resume from.',
+    )
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -172,11 +178,23 @@ def main():
     nets = nets.to(device)
     nets['denoiser'].setup_training(sigma_distribution_config)
 
-    # Phase 1 starts from scratch — no checkpoint loading.
     optimizer = torch.optim.AdamW(params=nets.parameters(), lr=1e-4)
 
+    # ---- Checkpoint resume -----------------------------------------------
+    start_epoch = 0
+    if args.resume:
+        state = torch.load(args.resume, map_location=device)
+        nets['denoiser'].load_state_dict(state)
+        try:
+            start_epoch = int(
+                os.path.basename(os.path.dirname(args.resume)).split('_')[-1]
+            )
+        except (ValueError, IndexError):
+            pass
+        print(f"Resuming phase-1 from epoch {start_epoch} ({args.resume})")
+
     # ---- Training loop ---------------------------------------------------
-    with tqdm(range(1, num_epochs + 1), desc='Epoch') as tglobal:
+    with tqdm(range(start_epoch + 1, num_epochs + 1), desc='Epoch') as tglobal:
         for epoch_idx in tglobal:
             if config.get('wandb', False):
                 wandb.log({'epoch': epoch_idx})

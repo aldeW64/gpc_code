@@ -366,16 +366,14 @@ class DualStreamUNet(nn.Module):
     Dual-stream UNet for middle fusion of two image modalities.
 
     Architecture:
-      - RGB encoder: separate d_blocks + downsamples
-      - Tactile encoder: separate d_blocks + downsamples (same topology)
-      - Shared mid_blocks (applied to RGB; tactile mid_blocks are separate but
-        same architecture so each modality has its own mid representation)
-      - CrossModalAttention: fuses RGB and tactile at the bottleneck
-      - Shared decoder (u_blocks + upsamples): uses fused RGB features and RGB
-        encoder skip connections to reconstruct the next RGB frame.
+      - RGB encoder: separate d_blocks + downsamples (with skip connections)
+      - Tactile encoder: separate d_blocks + downsamples (with skip connections)
+      - Separate mid_blocks per stream
+      - CrossModalAttention: bidirectional fusion at the bottleneck
+      - RGB decoder: fused RGB bottleneck + RGB skip connections → RGB features
+      - Tactile decoder: fused tactile bottleneck + tactile skip connections → tactile features
 
-    The decoder only uses RGB encoder skip connections because the prediction
-    target is the next RGB frame.
+    Both modalities are prediction targets, so both have symmetric encoder/decoder paths.
     """
 
     def __init__(
@@ -389,7 +387,7 @@ class DualStreamUNet(nn.Module):
         assert len(depths) == len(channels) == len(attn_depths)
         self._num_down = len(channels) - 1
 
-        # ---- RGB encoder ---------------------------------------------------
+        # ---- RGB encoder + decoder -----------------------------------------
         rgb_d_blocks, rgb_u_blocks = [], []
         for i, n in enumerate(depths):
             c1 = channels[max(0, i - 1)]
@@ -402,9 +400,6 @@ class DualStreamUNet(nn.Module):
                     attn=bool(attn_depths[i]),
                 )
             )
-            # Decoder u_blocks: the first ResBlock in each decoder stage
-            # receives the upsampled feature concatenated with the RGB encoder
-            # skip at that level.
             rgb_u_blocks.append(
                 ResBlocks(
                     list_in_channels=[2 * c2] * n + [c1 + c2],
@@ -415,14 +410,15 @@ class DualStreamUNet(nn.Module):
             )
         self.rgb_d_blocks = nn.ModuleList(rgb_d_blocks)
         self.rgb_u_blocks = nn.ModuleList(list(reversed(rgb_u_blocks)))
+        self.rgb_downsamples = nn.ModuleList(
+            [nn.Identity()] + [Downsample(c) for c in channels[:-1]]
+        )
+        self.rgb_upsamples = nn.ModuleList(
+            [nn.Identity()] + [Upsample(c) for c in reversed(channels[:-1])]
+        )
 
-        rgb_downsamples = [nn.Identity()] + [Downsample(c) for c in channels[:-1]]
-        rgb_upsamples = [nn.Identity()] + [Upsample(c) for c in reversed(channels[:-1])]
-        self.rgb_downsamples = nn.ModuleList(rgb_downsamples)
-        self.rgb_upsamples = nn.ModuleList(rgb_upsamples)
-
-        # ---- Tactile encoder -----------------------------------------------
-        tac_d_blocks = []
+        # ---- Tactile encoder + decoder -------------------------------------
+        tac_d_blocks, tac_u_blocks = [], []
         for i, n in enumerate(depths):
             c1 = channels[max(0, i - 1)]
             c2 = channels[i]
@@ -434,12 +430,24 @@ class DualStreamUNet(nn.Module):
                     attn=bool(attn_depths[i]),
                 )
             )
+            tac_u_blocks.append(
+                ResBlocks(
+                    list_in_channels=[2 * c2] * n + [c1 + c2],
+                    list_out_channels=[c2] * n + [c1],
+                    cond_channels=cond_channels,
+                    attn=bool(attn_depths[i]),
+                )
+            )
         self.tac_d_blocks = nn.ModuleList(tac_d_blocks)
+        self.tac_u_blocks = nn.ModuleList(list(reversed(tac_u_blocks)))
+        self.tac_downsamples = nn.ModuleList(
+            [nn.Identity()] + [Downsample(c) for c in channels[:-1]]
+        )
+        self.tac_upsamples = nn.ModuleList(
+            [nn.Identity()] + [Upsample(c) for c in reversed(channels[:-1])]
+        )
 
-        tac_downsamples = [nn.Identity()] + [Downsample(c) for c in channels[:-1]]
-        self.tac_downsamples = nn.ModuleList(tac_downsamples)
-
-        # ---- Mid-blocks (one per stream, fused after) ----------------------
+        # ---- Mid-blocks (one per stream) -----------------------------------
         self.rgb_mid_blocks = ResBlocks(
             list_in_channels=[channels[-1]] * 2,
             list_out_channels=[channels[-1]] * 2,
@@ -467,10 +475,8 @@ class DualStreamUNet(nn.Module):
         pad_w = math.ceil(w / 2 ** n) * 2 ** n - w
         return F.pad(x, (0, pad_w, 0, pad_h))
 
-    def encode_rgb(
-        self, x: Tensor, cond: Tensor
-    ) -> Tuple[Tensor, List]:
-        """Run the RGB encoder stream; return bottleneck features and skip list."""
+    def encode_rgb(self, x: Tensor, cond: Tensor) -> Tuple[Tensor, List]:
+        """Run the RGB encoder; return (bottleneck, skip_list)."""
         x = self._pad(x)
         d_outputs: List = []
         for block, down in zip(self.rgb_d_blocks, self.rgb_downsamples):
@@ -480,31 +486,38 @@ class DualStreamUNet(nn.Module):
         x, _ = self.rgb_mid_blocks(x, cond)
         return x, d_outputs
 
-    def encode_tac(self, x: Tensor, cond: Tensor) -> Tensor:
-        """Run the tactile encoder stream; return bottleneck features only."""
+    def encode_tac(self, x: Tensor, cond: Tensor) -> Tuple[Tensor, List]:
+        """Run the tactile encoder; return (bottleneck, skip_list)."""
         x = self._pad(x)
+        d_outputs: List = []
         for block, down in zip(self.tac_d_blocks, self.tac_downsamples):
             x_down = down(x)
-            x, _ = block(x_down, cond)
+            x, block_outputs = block(x_down, cond)
+            d_outputs.append((x_down, *block_outputs))
         x, _ = self.tac_mid_blocks(x, cond)
-        return x
+        return x, d_outputs
 
-    def decode(
-        self,
-        x: Tensor,
-        cond: Tensor,
-        rgb_d_outputs: List,
-        orig_h: int,
-        orig_w: int,
+    def decode_rgb(
+        self, x: Tensor, cond: Tensor, rgb_d_outputs: List, orig_h: int, orig_w: int
     ) -> Tensor:
-        """Run the shared decoder using fused bottleneck + RGB skip connections."""
+        """Decode RGB: fused RGB bottleneck + RGB skip connections."""
         for block, up, skip in zip(
             self.rgb_u_blocks, self.rgb_upsamples, reversed(rgb_d_outputs)
         ):
             x_up = up(x)
             x, _ = block(x_up, cond, skip[::-1])
-        x = x[..., :orig_h, :orig_w]
-        return x
+        return x[..., :orig_h, :orig_w]
+
+    def decode_tac(
+        self, x: Tensor, cond: Tensor, tac_d_outputs: List, orig_h: int, orig_w: int
+    ) -> Tensor:
+        """Decode tactile: fused tactile bottleneck + tactile skip connections."""
+        for block, up, skip in zip(
+            self.tac_u_blocks, self.tac_upsamples, reversed(tac_d_outputs)
+        ):
+            x_up = up(x)
+            x, _ = block(x_up, cond, skip[::-1])
+        return x[..., :orig_h, :orig_w]
 
     # ------------------------------------------------------------------
     # Full forward pass
@@ -512,25 +525,25 @@ class DualStreamUNet(nn.Module):
 
     def forward(
         self, rgb: Tensor, tac: Tensor, cond: Tensor
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Tensor]:
         """
         Args:
-            rgb:  (B, rgb_in_ch, H, W)  — concatenated past RGB frames + noisy next
-            tac:  (B, tac_in_ch, H, W)  — concatenated past tactile frames
+            rgb:  (B, rgb_in_ch, H, W)  — concatenated past RGB frames + noisy next RGB
+            tac:  (B, tac_in_ch, H, W)  — concatenated past tactile frames + noisy next tactile
             cond: (B, cond_channels)    — global conditioning vector
 
         Returns:
-            (B, channels[0], H, W)  — decoded features ready for conv_out
+            rgb_feat: (B, channels[0], H, W)  — decoded RGB features for conv_out_rgb
+            tac_feat: (B, channels[0], H, W)  — decoded tactile features for conv_out_tac
         """
         *_, orig_h, orig_w = rgb.shape
 
-        # Encode both streams
         rgb_bottleneck, rgb_d_outputs = self.encode_rgb(rgb, cond)
-        tac_bottleneck = self.encode_tac(tac, cond)
+        tac_bottleneck, tac_d_outputs = self.encode_tac(tac, cond)
 
-        # Fuse at bottleneck via cross-modal attention
-        rgb_fused, _ = self.cross_modal_attn(rgb_bottleneck, tac_bottleneck)
+        # Bidirectional cross-modal attention fuses both bottlenecks
+        rgb_fused, tac_fused = self.cross_modal_attn(rgb_bottleneck, tac_bottleneck)
 
-        # Decode using fused RGB features and RGB skip connections
-        out = self.decode(rgb_fused, cond, rgb_d_outputs, orig_h, orig_w)
-        return out
+        rgb_feat = self.decode_rgb(rgb_fused, cond, rgb_d_outputs, orig_h, orig_w)
+        tac_feat = self.decode_tac(tac_fused, cond, tac_d_outputs, orig_h, orig_w)
+        return rgb_feat, tac_feat

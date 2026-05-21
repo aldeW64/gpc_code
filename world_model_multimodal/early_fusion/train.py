@@ -13,6 +13,7 @@ Or from within the early_fusion/ directory:
 import argparse
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -38,12 +39,40 @@ from diffusion.inner_model import InnerModelConfig
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def save_checkpoint(nets: nn.ModuleDict, checkpoint_dir: str, action_stats: dict) -> None:
-    """Save model state dicts and action normalization statistics."""
+def find_latest_checkpoint(models_save_dir: str):
+    """Return (checkpoint_dir, epoch) for the highest saved epoch, or (None, 0)."""
+    if not os.path.isdir(models_save_dir):
+        return None, 0
+    pattern = re.compile(r"^checkpoint_epoch_(\d+)$")
+    best_epoch, best_dir = 0, None
+    for name in os.listdir(models_save_dir):
+        m = pattern.match(name)
+        if m:
+            epoch = int(m.group(1))
+            if epoch > best_epoch:
+                best_epoch, best_dir = epoch, os.path.join(models_save_dir, name)
+    return best_dir, best_epoch
+
+
+def save_checkpoint(
+    epoch: int,
+    nets: nn.ModuleDict,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: str,
+    action_stats: dict,
+) -> None:
+    """Save model state dicts, optimizer state, epoch, and action normalization statistics."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     for name, model in nets.items():
         path = os.path.join(checkpoint_dir, f"{name}.pth")
-        torch.save(model.state_dict(), path)
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            },
+            path,
+        )
         print(f"  Saved {path}")
     # Save action stats as JSON (numpy arrays -> lists)
     stats_path = os.path.join(checkpoint_dir, "action_stats.json")
@@ -87,7 +116,6 @@ def main() -> None:
     resize_scale: int = config["resize_scale"]
     lr: float = config["lr"]
     use_wandb: bool = config.get("wandb", False)
-    resume_checkpoint: Optional[str] = config.get("resume_checkpoint", None)
     phase_one_checkpoint: Optional[str] = config.get("phase_one_checkpoint", None)
 
     print(f"Device: {device}")
@@ -165,30 +193,35 @@ def main() -> None:
     nets = nets.to(device)
     nets["denoiser"].setup_training(sigma_dist_cfg)
 
-    # ---- Phase 2: load Phase-1 weights before multi-step training ----
-    if phase_one_checkpoint is not None:
-        state = torch.load(phase_one_checkpoint, map_location=device)
-        if isinstance(state, dict) and "model_state_dict" in state:
-            state = state["model_state_dict"]
-        nets["denoiser"].load_state_dict(state)
-        print(f"Loaded phase-1 checkpoint: {phase_one_checkpoint}")
-
-    # ---- optional mid-run resume (restores optimizer state too) ----
-    elif resume_checkpoint is not None:
-        ckpt_path = os.path.join(resume_checkpoint, "denoiser.pth")
-        if os.path.exists(ckpt_path):
-            state = torch.load(ckpt_path, map_location=device)
-            nets["denoiser"].load_state_dict(state)
-            print(f"Resumed from checkpoint: {ckpt_path}")
-        else:
-            print(f"Warning: resume_checkpoint set but '{ckpt_path}' not found; starting fresh")
-
     # ---- optimizer ----
     optimizer = torch.optim.AdamW(nets.parameters(), lr=lr)
 
+    # ---- checkpoint loading ----
+    start_epoch = 0
+    if phase_one_checkpoint is not None:
+        # Phase 2: warm-start from phase-1 weights; optimizer starts fresh
+        state = torch.load(phase_one_checkpoint, map_location=device)
+        state = state.get("model_state_dict", state) if isinstance(state, dict) else state
+        nets["denoiser"].load_state_dict(state)
+        print(f"Loaded phase-1 checkpoint: {phase_one_checkpoint}")
+    else:
+        # Auto-resume: find the latest checkpoint in models_save_dir
+        latest_dir, latest_epoch = find_latest_checkpoint(models_save_dir)
+        if latest_dir is not None:
+            ckpt_path = os.path.join(latest_dir, "denoiser.pth")
+            raw = torch.load(ckpt_path, map_location=device)
+            if isinstance(raw, dict) and "model_state_dict" in raw:
+                nets["denoiser"].load_state_dict(raw["model_state_dict"])
+                optimizer.load_state_dict(raw["optimizer_state_dict"])
+                start_epoch = raw.get("epoch", latest_epoch)
+            else:
+                nets["denoiser"].load_state_dict(raw)
+                start_epoch = latest_epoch
+            print(f"Resuming from epoch {start_epoch} ({latest_dir})")
+
     # ---- training loop ----
-    print(f"Starting training: {num_epochs} epochs, batch_size={batch_size}, lr={lr}")
-    with tqdm(range(1, num_epochs + 1), desc="Epoch") as tglobal:
+    print(f"Starting training: epochs {start_epoch + 1}–{num_epochs}, batch_size={batch_size}, lr={lr}")
+    with tqdm(range(start_epoch + 1, num_epochs + 1), desc="Epoch") as tglobal:
         for epoch_idx in tglobal:
             if use_wandb:
                 import wandb
@@ -216,7 +249,7 @@ def main() -> None:
 
             # Save checkpoint every epoch
             checkpoint_dir = os.path.join(models_save_dir, f"checkpoint_epoch_{epoch_idx}")
-            save_checkpoint(nets, checkpoint_dir, action_stats)
+            save_checkpoint(epoch_idx, nets, optimizer, checkpoint_dir, action_stats)
 
     print("Training complete.")
     if use_wandb:

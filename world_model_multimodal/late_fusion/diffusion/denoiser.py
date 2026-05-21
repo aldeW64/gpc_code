@@ -2,13 +2,18 @@
 Late Fusion (Score Composition) denoiser.
 
 Two independent InnerModel experts are trained jointly:
-  - model_rgb: conditioned on prev_rgb + actions → predicts eps for next RGB frame
-  - model_tac: conditioned on prev_tactile + actions → also predicts eps for the same RGB frame
+  - model_rgb: conditioned on prev_rgb  → predicts noise for the next RGB frame
+  - model_tac: conditioned on prev_tac  → predicts noise for the next tactile frame
 
-At inference, their score estimates are composed:
-    eps_composed = w_rgb * eps_rgb + w_tac * eps_tac
-which in the EDM / preconditioning framework translates to composing model outputs
-before the c_skip / c_out wrapping step.
+A learned WeightPredictor blends the two expert outputs to produce predictions
+for both modalities:
+
+    composed_rgb = w_for_rgb[0] * out_rgb + w_for_rgb[1] * out_tac
+    composed_tac = w_for_tac[0] * out_rgb + w_for_tac[1] * out_tac
+
+where weights are softmax-normalized pairs predicted from the conditioning vector
+(sigma, sigma_cond, actions). Both RGB and tactile are autoregressive prediction
+targets; both rolling buffers are updated each step.
 """
 
 from dataclasses import dataclass, field
@@ -19,21 +24,21 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffusion.inner_model import InnerModel, InnerModelConfig
+from diffusion.inner_model import InnerModel, InnerModelConfig, WeightPredictor
+from diffusion.blocks import FourierFeatures
 
 
 def add_dims(input: Tensor, n: int) -> Tensor:
-    """Expand a 1-D tensor to n dimensions by appending singleton dims."""
     return input.reshape(input.shape + (1,) * (n - input.ndim))
 
 
 @dataclass
 class Conditioners:
-    c_in: Tensor      # input scaling  (B,1,1,1)
-    c_out: Tensor     # output scaling (B,1,1,1)
-    c_skip: Tensor    # skip scaling   (B,1,1,1)
-    c_noise: Tensor   # noise emb input (B,)
-    c_noise_cond: Tensor  # cond noise emb input (B,)
+    c_in: Tensor
+    c_out: Tensor
+    c_skip: Tensor
+    c_noise: Tensor
+    c_noise_cond: Tensor
 
 
 @dataclass
@@ -46,16 +51,14 @@ class SigmaDistributionConfig:
 
 @dataclass
 class LateFusionDenoiserConfig:
-    # Shared architecture settings for both experts
-    img_channels: int = 3              # output/target space (RGB)
-    num_steps_conditioning: int = 4    # number of past frames fed as conditioning
+    img_channels: int = 3
+    num_steps_conditioning: int = 4
     cond_channels: int = 256
     action_dim: int = 7
     depths: List[int] = field(default_factory=lambda: [2, 2, 2, 2])
     channels: List[int] = field(default_factory=lambda: [96, 96, 96, 96])
     attn_depths: List[int] = field(default_factory=lambda: [0, 0, 1, 1])
 
-    # EDM preconditioning
     sigma_data: float = 0.5
     sigma_offset_noise: float = 0.1
     noise_previous_obs: bool = True
@@ -63,19 +66,17 @@ class LateFusionDenoiserConfig:
     # Training loss balance: loss = alpha * loss_rgb + (1-alpha) * loss_tac
     loss_alpha: float = 0.5
 
-    # Inference composition weights [w_rgb, w_tac]
-    composition_weights: List[float] = field(default_factory=lambda: [0.7, 0.3])
-
 
 class LateFusionDenoiser(nn.Module):
     """
-    Late-fusion world model with two denoiser experts:
-      - model_rgb: denoises next RGB frame conditioned on past RGB frames + actions
-      - model_tac: denoises next RGB frame conditioned on past tactile frames + actions
+    Late-fusion world model with two expert denoisers and a learned weight predictor.
 
-    Both predict in the same output space (RGB). During sampling, their outputs are
-    composed via weighted sum before the skip-connection wrapping step, implementing
-    additive score composition in the EDM framework.
+    model_rgb: denoises next RGB frame conditioned on past RGB frames + actions
+    model_tac: denoises next tactile frame conditioned on past tactile frames + actions
+
+    At each step, the WeightPredictor produces adaptive blending weights so that
+    both experts contribute to both output modalities. Both buffers are updated
+    autoregressively during training.
     """
 
     def __init__(self, cfg: LateFusionDenoiserConfig) -> None:
@@ -83,7 +84,7 @@ class LateFusionDenoiser(nn.Module):
         self.cfg = cfg
         self.sigma_data = cfg.sigma_data
 
-        # RGB expert: conditioning modality is RGB (cond_img_channels = 3)
+        # RGB expert: conditions on RGB history, predicts noise in RGB space
         cfg_rgb = InnerModelConfig(
             img_channels=cfg.img_channels,
             cond_img_channels=3,
@@ -96,8 +97,7 @@ class LateFusionDenoiser(nn.Module):
             is_upsampler=False,
         )
 
-        # Tactile expert: conditioning modality is tactile (cond_img_channels = 3)
-        # Same channel count since both modalities are 3-channel images after resize
+        # Tactile expert: conditions on tactile history, predicts noise in tactile space
         cfg_tac = InnerModelConfig(
             img_channels=cfg.img_channels,
             cond_img_channels=3,
@@ -113,10 +113,23 @@ class LateFusionDenoiser(nn.Module):
         self.model_rgb = InnerModel(cfg_rgb)
         self.model_tac = InnerModel(cfg_tac)
 
-        self.alpha = cfg.loss_alpha
-        self.composition_weights = cfg.composition_weights
+        # Shared conditioning modules for the weight predictor
+        self.noise_emb = FourierFeatures(cfg.cond_channels)
+        self.noise_cond_emb = FourierFeatures(cfg.cond_channels)
+        hidden_per_step = cfg.cond_channels // cfg.num_steps_conditioning
+        self.act_emb = nn.Sequential(
+            nn.Linear(cfg.action_dim, hidden_per_step),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cfg.cond_channels, cfg.cond_channels),
+            nn.SiLU(),
+            nn.Linear(cfg.cond_channels, cfg.cond_channels),
+        )
+        self.weight_predictor = WeightPredictor(cfg.cond_channels)
 
-        # Will be set by setup_training()
+        self.alpha = cfg.loss_alpha
         self.sample_sigma_training = None
 
     @property
@@ -128,7 +141,6 @@ class LateFusionDenoiser(nn.Module):
     # ------------------------------------------------------------------
 
     def setup_training(self, cfg: SigmaDistributionConfig) -> None:
-        """Register the log-normal sigma sampler used during training."""
         assert self.sample_sigma_training is None, "setup_training called twice"
 
         def sample_sigma(n: int, device: torch.device) -> Tensor:
@@ -138,17 +150,15 @@ class LateFusionDenoiser(nn.Module):
         self.sample_sigma_training = sample_sigma
 
     # ------------------------------------------------------------------
-    # EDM preconditioning (shared by both experts)
+    # EDM preconditioning
     # ------------------------------------------------------------------
 
     def apply_noise(self, x: Tensor, sigma: Tensor, sigma_offset_noise: float) -> Tensor:
-        """Add offset noise + isotropic Gaussian noise scaled by sigma."""
         b, c, _, _ = x.shape
         offset_noise = sigma_offset_noise * torch.randn(b, c, 1, 1, device=self.device)
         return x + offset_noise + torch.randn_like(x) * add_dims(sigma, x.ndim)
 
     def compute_conditioners(self, sigma: Tensor, sigma_cond: Optional[Tensor]) -> Conditioners:
-        """Compute EDM preconditioning scalars from sigma values."""
         sigma = (sigma ** 2 + self.cfg.sigma_offset_noise ** 2).sqrt()
         c_in = 1 / (sigma ** 2 + self.sigma_data ** 2).sqrt()
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
@@ -165,17 +175,16 @@ class LateFusionDenoiser(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Per-expert model calls
+    # Per-expert calls
     # ------------------------------------------------------------------
 
     def _call_rgb_expert(
         self,
-        noisy_next_rgb: Tensor,
+        noisy_next_rgb: Tensor,  # (B, 3, H, W)
         prev_rgb: Tensor,
         act: Tensor,
         cs: Conditioners,
     ) -> Tensor:
-        """Raw model output from the RGB expert (before c_skip / c_out wrapping)."""
         return self.model_rgb(
             noisy_next_rgb * cs.c_in,
             cs.c_noise,
@@ -186,14 +195,13 @@ class LateFusionDenoiser(nn.Module):
 
     def _call_tac_expert(
         self,
-        noisy_next_rgb: Tensor,
+        noisy_next_tac: Tensor,  # (B, 3, H, W) — noisy tactile target (not RGB)
         prev_tac: Tensor,
         act: Tensor,
         cs: Conditioners,
     ) -> Tensor:
-        """Raw model output from the tactile expert (before c_skip / c_out wrapping)."""
         return self.model_tac(
-            noisy_next_rgb * cs.c_in,
+            noisy_next_tac * cs.c_in,
             cs.c_noise,
             cs.c_noise_cond,
             prev_tac / self.sigma_data,
@@ -201,88 +209,78 @@ class LateFusionDenoiser(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Output wrapping (quantize denoised estimate back to [-1, 1] grid)
+    # Output wrapping
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def wrap_model_output(
-        self,
-        noisy_next_obs: Tensor,
-        model_output: Tensor,
-        cs: Conditioners,
-    ) -> Tensor:
-        """
-        Apply EDM skip connection and quantize to {0,...,255}/255*2-1 pixel grid.
-        d = c_skip * x_noisy + c_out * model_output, then quantize.
-        """
-        d = cs.c_skip * noisy_next_obs + cs.c_out * model_output
-        # Quantize to {0, ..., 255}, then back to [-1, 1]
+    def wrap_model_output(self, noisy: Tensor, model_output: Tensor, cs: Conditioners) -> Tensor:
+        d = cs.c_skip * noisy + cs.c_out * model_output
         d = d.clamp(-1, 1).add(1).div(2).mul(255).byte().div(255).mul(2).sub(1)
         return d
 
     # ------------------------------------------------------------------
-    # Single-step denoise (for sampling / evaluation)
+    # Shared conditioning vector for weight predictor
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
-    def denoise_rgb(
-        self,
-        noisy_next_rgb: Tensor,
-        sigma: Tensor,
-        sigma_cond: Optional[Tensor],
-        prev_rgb: Tensor,
-        act: Tensor,
-    ) -> Tensor:
-        """Denoise using only the RGB expert."""
-        cs = self.compute_conditioners(sigma, sigma_cond)
-        out = self._call_rgb_expert(noisy_next_rgb, prev_rgb, act, cs)
-        return self.wrap_model_output(noisy_next_rgb, out, cs)
+    def _compute_wp_cond(self, c_noise: Tensor, c_noise_cond: Tensor, act: Tensor) -> Tensor:
+        """Compute the conditioning vector fed to the weight predictor.
 
-    @torch.no_grad()
-    def denoise_tac(
-        self,
-        noisy_next_rgb: Tensor,
-        sigma: Tensor,
-        sigma_cond: Optional[Tensor],
-        prev_tac: Tensor,
-        act: Tensor,
-    ) -> Tensor:
-        """Denoise using only the tactile expert."""
-        cs = self.compute_conditioners(sigma, sigma_cond)
-        out = self._call_tac_expert(noisy_next_rgb, prev_tac, act, cs)
-        return self.wrap_model_output(noisy_next_rgb, out, cs)
+        Args:
+            c_noise:      (B,) — log-sigma / 4 (squeezed from Conditioners)
+            c_noise_cond: (B,) — log-sigma_cond / 4
+            act:          (B, n, action_dim)
+        """
+        act_emb = self.act_emb(act)  # (B, cond_channels)
+        return self.cond_proj(
+            self.noise_emb(c_noise) + self.noise_cond_emb(c_noise_cond) + act_emb
+        )  # (B, cond_channels)
+
+    # ------------------------------------------------------------------
+    # Inference denoising
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def denoise_composed(
         self,
         noisy_next_rgb: Tensor,
+        noisy_next_tac: Tensor,
         sigma: Tensor,
         sigma_cond: Optional[Tensor],
         prev_rgb: Tensor,
         prev_tac: Tensor,
         act: Tensor,
-        w_rgb: float = 0.7,
-        w_tac: float = 0.3,
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Tensor]:
         """
-        Compose score estimates from both experts.
+        Single denoising step using both experts + weight predictor.
 
-        In the EDM epsilon-prediction parameterisation, additive score composition
-        corresponds to a weighted sum of the raw model outputs (before the
-        c_skip / c_out wrapping):
-
-            composed_output = w_rgb * out_rgb + w_tac * out_tac
-
-        The skip-connection wrapping is then applied once on top of the composed output.
-        This faithfully implements
-            ∇_x log p(x | rgb, tac) ≈ w_rgb * score_rgb + w_tac * score_tac
-        without double-counting the prior.
+        Returns:
+            denoised_rgb: (B, 3, H, W)
+            denoised_tac: (B, 3, H, W)
         """
         cs = self.compute_conditioners(sigma, sigma_cond)
+
+        # Weight predictor conditioning
+        c_noise_1d = cs.c_noise.view(-1)
+        c_noise_cond_1d = cs.c_noise_cond.view(-1)
+        wp_cond = self._compute_wp_cond(c_noise_1d, c_noise_cond_1d, act)
+        w_for_rgb, w_for_tac = self.weight_predictor(wp_cond)
+
         out_rgb = self._call_rgb_expert(noisy_next_rgb, prev_rgb, act, cs)
-        out_tac = self._call_tac_expert(noisy_next_rgb, prev_tac, act, cs)
-        composed_output = w_rgb * out_rgb + w_tac * out_tac
-        return self.wrap_model_output(noisy_next_rgb, composed_output, cs)
+        out_tac = self._call_tac_expert(noisy_next_tac, prev_tac, act, cs)
+
+        b = out_rgb.shape[0]
+        w_rr = w_for_rgb[:, 0].view(b, 1, 1, 1)
+        w_tr = w_for_rgb[:, 1].view(b, 1, 1, 1)
+        w_rt = w_for_tac[:, 0].view(b, 1, 1, 1)
+        w_tt = w_for_tac[:, 1].view(b, 1, 1, 1)
+
+        composed_rgb = w_rr * out_rgb + w_tr * out_tac
+        composed_tac = w_rt * out_rgb + w_tt * out_tac
+
+        return (
+            self.wrap_model_output(noisy_next_rgb, composed_rgb, cs),
+            self.wrap_model_output(noisy_next_tac, composed_tac, cs),
+        )
 
     # ------------------------------------------------------------------
     # Training forward pass
@@ -294,23 +292,19 @@ class LateFusionDenoiser(nn.Module):
         device: torch.device,
     ) -> Tuple[Tensor, Dict[str, float]]:
         """
-        Autoregressive multi-step training forward pass.
+        Autoregressive multi-step training forward pass over both modalities.
 
         batch keys:
-          'front'   : (B, T, 3, H, W)  — RGB frames, normalised to [-1, 1]
-          'tactile' : (B, T, 3, H, W)  — tactile frames, normalised to [-1, 1]
-          'action'  : (B, T, 7)         — actions, normalised to [-1, 1]
+          'front'   : (B, T, 3, H, W) — RGB frames in [-1, 1]
+          'tactile' : (B, T, 3, H, W) — tactile frames in [-1, 1]
+          'action'  : (B, T, 7)        — actions in [-1, 1]
 
-        T = obs_horizon + pred_horizon (= num_steps_conditioning + seq_length)
-
-        Autoregressive loop:
-          - For each future step i:
-              * Both experts share the same noisy target (noisy next RGB frame)
-              * RGB expert: conditioned on rolling prev_rgb (initially GT, then model prediction)
-              * Tactile expert: conditioned on GT tactile (never predicted autoregressively)
-              * Loss = alpha * MSE(rgb_out, target) + (1-alpha) * MSE(tac_out, target)
-              * After each step, update prev_rgb with the RGB expert's denoised output
-                (teacher-forced rollout for training stability, following phase-two practice)
+        For each future step i:
+          * model_rgb sees noisy RGB target + rolling prev_rgb
+          * model_tac sees noisy tactile target + rolling prev_tac
+          * WeightPredictor blends both experts for each output modality
+          * Loss = alpha * MSE(composed_rgb, target_rgb) + (1-alpha) * MSE(composed_tac, target_tac)
+          * Both RGB and tactile buffers are updated with their composed predictions
         """
         front = batch['front'].to(device)     # (B, T, 3, H, W)
         tactile = batch['tactile'].to(device)  # (B, T, 3, H, W)
@@ -318,28 +312,23 @@ class LateFusionDenoiser(nn.Module):
 
         b, t, c, h, w = front.size()
         n = self.cfg.num_steps_conditioning
-        seq_length = t - n   # number of autoregressive prediction steps
+        seq_length = t - n
 
-        # Working copy of RGB frames — gets overwritten with model predictions
-        # after each step (teacher-forcing on its own predictions, matching phase-two).
-        all_rgb = front.clone()   # (B, T, 3, H, W)
+        all_rgb = front.clone()
+        all_tac = tactile.clone()  # both roll out autoregressively
 
         total_loss = torch.tensor(0.0, device=device)
         total_loss_rgb = 0.0
         total_loss_tac = 0.0
 
         for i in range(seq_length):
-            # ---- Conditioning frames ----
-            # RGB expert sees rolling predictions for prev frames
-            prev_rgb = all_rgb[:, i: n + i].reshape(b, n * c, h, w)      # (B, n*3, H, W)
-            # Tactile expert always sees ground-truth tactile frames
-            prev_tac = tactile[:, i: n + i].reshape(b, n * c, h, w)      # (B, n*3, H, W)
-            # Actions aligned to the conditioning window
-            prev_act = act[:, i: n + i]                                    # (B, n, 7)
-            # Ground-truth next RGB frame (target)
-            target_rgb = all_rgb[:, n + i]                                 # (B, 3, H, W)
+            prev_rgb = all_rgb[:, i: n + i].reshape(b, n * c, h, w)
+            prev_tac = all_tac[:, i: n + i].reshape(b, n * c, h, w)
+            prev_act = act[:, i: n + i]
+            target_rgb = all_rgb[:, n + i]
+            target_tac = all_tac[:, n + i]
 
-            # ---- Optional conditioning noise ----
+            # Noise both conditioning streams
             if self.cfg.noise_previous_obs:
                 sigma_cond = self.sample_sigma_training(b, device)
                 prev_rgb_noised = self.apply_noise(prev_rgb, sigma_cond, self.cfg.sigma_offset_noise)
@@ -349,35 +338,49 @@ class LateFusionDenoiser(nn.Module):
                 prev_rgb_noised = prev_rgb
                 prev_tac_noised = prev_tac
 
-            # ---- Sample noise for the target frame ----
+            # Sample one noise level and corrupt both targets
             sigma = self.sample_sigma_training(b, device)
-            noisy_obs = self.apply_noise(target_rgb, sigma, self.cfg.sigma_offset_noise)
+            noisy_rgb = self.apply_noise(target_rgb, sigma, self.cfg.sigma_offset_noise)
+            noisy_tac = self.apply_noise(target_tac, sigma, self.cfg.sigma_offset_noise)
 
-            # ---- Forward through both experts ----
             cs = self.compute_conditioners(sigma, sigma_cond)
 
-            out_rgb = self._call_rgb_expert(noisy_obs, prev_rgb_noised, prev_act, cs)
-            out_tac = self._call_tac_expert(noisy_obs, prev_tac_noised, prev_act, cs)
+            # Weight predictor conditioning (uses 1-D c_noise values)
+            c_noise_1d = cs.c_noise.view(b)
+            c_noise_cond_1d = cs.c_noise_cond.view(b)
+            wp_cond = self._compute_wp_cond(c_noise_1d, c_noise_cond_1d, prev_act)
+            w_for_rgb, w_for_tac = self.weight_predictor(wp_cond)
 
-            # ---- Compute target in denoiser output space ----
-            # target = (x_clean - c_skip * x_noisy) / c_out
-            target = (target_rgb - cs.c_skip * noisy_obs) / cs.c_out
+            # Expert raw outputs
+            out_rgb = self._call_rgb_expert(noisy_rgb, prev_rgb_noised, prev_act, cs)
+            out_tac = self._call_tac_expert(noisy_tac, prev_tac_noised, prev_act, cs)
 
-            # ---- Per-expert losses ----
-            loss_rgb = F.mse_loss(out_rgb, target)
-            loss_tac = F.mse_loss(out_tac, target)
+            # Adaptive blending: each weight pair sums to 1 (softmax)
+            w_rr = w_for_rgb[:, 0].view(b, 1, 1, 1)  # RGB expert → RGB output
+            w_tr = w_for_rgb[:, 1].view(b, 1, 1, 1)  # tac expert → RGB output
+            w_rt = w_for_tac[:, 0].view(b, 1, 1, 1)  # RGB expert → tac output
+            w_tt = w_for_tac[:, 1].view(b, 1, 1, 1)  # tac expert → tac output
+
+            composed_rgb = w_rr * out_rgb + w_tr * out_tac
+            composed_tac = w_rt * out_rgb + w_tt * out_tac
+
+            # EDM targets
+            target_rgb_edm = (target_rgb - cs.c_skip * noisy_rgb) / cs.c_out
+            target_tac_edm = (target_tac - cs.c_skip * noisy_tac) / cs.c_out
+
+            loss_rgb = F.mse_loss(composed_rgb, target_rgb_edm)
+            loss_tac = F.mse_loss(composed_tac, target_tac_edm)
             step_loss = self.alpha * loss_rgb + (1.0 - self.alpha) * loss_tac
             total_loss = total_loss + step_loss
             total_loss_rgb += loss_rgb.item()
             total_loss_tac += loss_tac.item()
 
-            # ---- Update rolling RGB buffer with RGB expert's denoised output ----
-            # This implements the autoregressive teacher-forcing strategy from phase-two:
-            # the model's own RGB predictions become the conditioning for future steps.
-            # Tactile is never predicted — always read from GT.
+            # Update both rolling buffers with composed denoised outputs
             with torch.no_grad():
-                denoised = self.wrap_model_output(noisy_obs, out_rgb, cs)
-            all_rgb[:, n + i] = denoised.detach()
+                denoised_rgb = self.wrap_model_output(noisy_rgb, composed_rgb, cs)
+                denoised_tac = self.wrap_model_output(noisy_tac, composed_tac, cs)
+            all_rgb[:, n + i] = denoised_rgb.detach()
+            all_tac[:, n + i] = denoised_tac.detach()
 
         total_loss = total_loss / seq_length
         metrics = {
