@@ -63,6 +63,13 @@ def main():
         default='./configs/train_manifeel_phase_two_config.yml',
         help='Path to the configuration YAML file.',
     )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='Path to a phase-2 denoiser.pth to resume an interrupted run '
+             '(skips loading the phase-1 checkpoint from the config).',
+    )
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -172,17 +179,29 @@ def main():
     nets['denoiser'] = Denoiser(denoiser_config)
     nets = nets.to(device)
     nets['denoiser'].setup_training(sigma_distribution_config)
-    # ---- Load Phase-1 checkpoint -----------------------------------------
-    phase_one_ckpt = resolve_path(config['phase_one_checkpoint'])
-    print(f"Loading phase-1 checkpoint from: {phase_one_ckpt}")
-    model_state_dict = torch.load(phase_one_ckpt, map_location=device)
-    nets['denoiser'].load_state_dict(model_state_dict)
 
-    # ---- Optimiser -------------------------------------------------------
+    # ---- Checkpoint loading ----------------------------------------------
+    # Priority: --resume (interrupted phase-2 run) > phase_one_checkpoint (fresh phase-2)
     optimizer = torch.optim.AdamW(params=nets.parameters(), lr=1e-4)
+    start_epoch = 0
+    if args.resume:
+        state = torch.load(args.resume, map_location=device)
+        nets['denoiser'].load_state_dict(state)
+        try:
+            start_epoch = int(
+                os.path.basename(os.path.dirname(args.resume)).split('_')[-1]
+            )
+        except (ValueError, IndexError):
+            pass
+        print(f"Resuming phase-2 from epoch {start_epoch} ({args.resume})")
+    else:
+        phase_one_ckpt = resolve_path(config['phase_one_checkpoint'])
+        print(f"Loading phase-1 checkpoint from: {phase_one_ckpt}")
+        model_state_dict = torch.load(phase_one_ckpt, map_location=device)
+        nets['denoiser'].load_state_dict(model_state_dict)
 
     # ---- Training loop ---------------------------------------------------
-    with tqdm(range(1, num_epochs + 1), desc='Epoch') as tglobal:
+    with tqdm(range(start_epoch + 1, num_epochs + 1), desc='Epoch') as tglobal:
         for epoch_idx in tglobal:
             if config.get('wandb', False):
                 wandb.log({'epoch': epoch_idx})

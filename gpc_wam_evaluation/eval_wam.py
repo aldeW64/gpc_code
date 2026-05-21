@@ -15,19 +15,23 @@ except ModuleNotFoundError as e:
     ) from e
 from tqdm.auto import tqdm
 def _maybe_vwrite(path: str, frames, enabled: bool) -> None:
-    if not enabled:
+    if not enabled or not frames:
         return
+    import imageio
+    writer = imageio.get_writer(path, fps=10, codec="libx264", quality=None, macro_block_size=None, pixelformat="yuv420p")
     try:
-        from skvideo.io import vwrite  # type: ignore
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "Missing dependency 'skvideo'. Either install scikit-video, or set eval.save_video: false."
-        ) from e
-    # skvideo calls ndarray.tostring() which was removed in NumPy 2.0; patch it.
-    import numpy as _np
-    if not hasattr(_np.ndarray, "tostring"):
-        _np.ndarray.tostring = _np.ndarray.tobytes  # type: ignore[attr-defined]
-    vwrite(path, frames)
+        for frame in frames:
+            # env.render returns RGB HWC uint8 — imageio expects the same
+            writer.append_data(np.asarray(frame))
+    finally:
+        writer.close()
+
+
+def _save_goal_image(path: str, goal_chw_01: np.ndarray) -> None:
+    """Save CHW float [0,1] goal image as a PNG file."""
+    import imageio
+    hwc_uint8 = (np.moveaxis(goal_chw_01, 0, -1) * 255).clip(0, 255).astype(np.uint8)
+    imageio.imwrite(path, hwc_uint8)
 
 from gpc_rank_evaluation.utils import (
     create_injected_noise,
@@ -41,7 +45,6 @@ from gpc_rank_evaluation.ema import SimpleEMAModel
 from .planners import diffusion_sample_actions, mppi_sample_actions
 from .wam_adapter import WamAdapterConfig, WamWorldModelAdapter
 from .gpc_world_model_adapter import GpcWorldModelConfig, GpcWorldModelAdapter
-from .iws_adapter import IWSAdapterConfig, IWSWorldModelAdapter
 
 
 def _to_torch_image(chw: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -109,6 +112,7 @@ def _build_world_model(config: Dict[str, Any], device: torch.device):
         world_model = GpcWorldModelAdapter(gpc_cfg, device=device)
         return world_model, GpcWorldModelAdapter.num_history, None
     elif wm_type == "iws":
+        from .iws_adapter import IWSAdapterConfig, IWSWorldModelAdapter
         iws_cfg_raw = config["iws_world_model"]
         iws_cfg = IWSAdapterConfig(
             ckpt_path=str(iws_cfg_raw["ckpt_path"]),
@@ -340,6 +344,7 @@ def eval_wam(config: Dict[str, Any]) -> np.ndarray:
 
         # Prepare goal image at the resolution the world model compares at.
         goal_img_raw = _goal_only_image(env)  # (3, resize_scale, resize_scale) in [0,1]
+        _save_goal_image(os.path.join(output_dir, f"goal_image_ep{ep:03d}.png"), goal_img_raw)
         goal_img_t = _prepare_goal_image_t(goal_img_raw, wm_type, wam_cfg, device)
 
         rewards = []

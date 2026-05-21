@@ -35,30 +35,6 @@ import torch
 from einops import rearrange
 from omegaconf import OmegaConf
 
-# Make sure the interactive_world_sim package is importable from anywhere that
-# this adapter is used (e.g. when called from gpc_wam_evaluation running at
-# the repo root).
-_REPO_ROOT = Path(__file__).absolute().parents[1]
-_IWS_ROOT = _REPO_ROOT / "interactive_world_sim"
-if str(_IWS_ROOT) not in sys.path:
-    sys.path.insert(0, str(_IWS_ROOT))
-
-import numpy as np  # noqa: F811 (re-import after potential sys.path change is fine)
-
-# Register OmegaConf resolvers that latent_world_model.yaml relies on.
-if not OmegaConf.has_resolver("eval"):
-    OmegaConf.register_new_resolver("eval", lambda expr: eval(expr, {"np": np}))
-if not OmegaConf.has_resolver("torch"):
-    OmegaConf.register_new_resolver("torch", lambda x: getattr(torch, x))
-
-from interactive_world_sim.algorithms.latent_dynamics import LatentWorldModel
-from interactive_world_sim.algorithms.common.diffusion_helper import render_img_cm
-from interactive_world_sim.utils.normalizer import (
-    LinearNormalizer,
-    get_image_range_normalizer,
-    get_range_normalizer_from_stat,
-    array_to_stats,
-)
 
 
 def _auto_detect_cfg_path(ckpt_path: str) -> Optional[str]:
@@ -98,6 +74,20 @@ class IWSWorldModelAdapter:
     ) -> None:
         self.cfg = cfg
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Deferred: only add interactive_world_sim to sys.path and import its
+        # modules here, so that importing iws_adapter itself (at module scope)
+        # does not pull in the IWS package.
+        _iws_root = Path(__file__).absolute().parents[1] / "interactive_world_sim"
+        if str(_iws_root) not in sys.path:
+            sys.path.insert(0, str(_iws_root))
+        if not OmegaConf.has_resolver("eval"):
+            OmegaConf.register_new_resolver("eval", lambda expr: eval(expr, {"np": np}))
+        if not OmegaConf.has_resolver("torch"):
+            OmegaConf.register_new_resolver("torch", lambda x: getattr(torch, x))
+        from interactive_world_sim.algorithms.latent_dynamics import LatentWorldModel
+        from interactive_world_sim.algorithms.common.diffusion_helper import render_img_cm
+        self._render_img_cm = render_img_cm
 
         # --- resolve hydra config ---
         cfg_path = cfg.cfg_path if cfg.cfg_path else _auto_detect_cfg_path(cfg.ckpt_path)
@@ -139,9 +129,14 @@ class IWSWorldModelAdapter:
         )
 
     @staticmethod
-    def _default_pusht_normalizer() -> LinearNormalizer:
+    def _default_pusht_normalizer():
         """Fallback normalizer using known PushT action range."""
         import numpy as np
+        from interactive_world_sim.utils.normalizer import (
+            LinearNormalizer,
+            get_image_range_normalizer,
+            get_range_normalizer_from_stat,
+        )
 
         normalizer = LinearNormalizer()
         normalizer["image"] = get_image_range_normalizer()
@@ -207,7 +202,7 @@ class IWSWorldModelAdapter:
         z_final = z_future[:, -1, :, :, :]  # (1, C_lat, H_lat, W_lat)
 
         # render_img_cm returns (B, 3*num_views, H, W) in [0,1]
-        img = render_img_cm(
+        img = self._render_img_cm(
             model,
             z_final,
             self.resolution,

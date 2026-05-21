@@ -4,3 +4,4 @@ wandb/
 dataset/
 all_checkpoints/
 wam/
+slurm_logs/

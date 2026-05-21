@@ -35,6 +35,11 @@
 #   early  — concat(RGB, tactile) → 6-ch UNet; predicts both modalities
 #   middle — dual UNet encoder streams + CrossModalAttention; predicts RGB only
 #   late   — two independent expert denoisers; composed at inference
+#
+# Auto-resume: train.py detects the newest checkpoint in models_save_dir
+# automatically, so interrupted runs resume without any extra flags.
+# For phase 2, if no phase-1 checkpoint is given, the newest checkpoint in
+# saved_checkpoints_phase1/ is auto-detected and injected into the config.
 
 set -e
 
@@ -42,8 +47,7 @@ FUSION=${1:-early}
 PHASE=${2:-phase1}
 PHASE1_CKPT_OVERRIDE=${3:-""}
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-mkdir -p "$REPO_ROOT/slurm_logs"
+REPO_ROOT="/n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code"
 
 source /n/sw/Miniforge3-24.11.3-0/etc/profile.d/conda.sh
 conda activate gpc
@@ -71,9 +75,31 @@ if [ ! -d "$FUSION_DIR" ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Helper: return path to the newest denoiser.pth under checkpoint_epoch_N/
+# subdirectories of a given directory, or empty string if none found.
+# ---------------------------------------------------------------------------
+find_latest_gpc_ckpt() {
+    local dir="$1"
+    [ -d "$dir" ] || { echo ""; return; }
+    local best_epoch=0 best_path=""
+    for d in "$dir"/checkpoint_epoch_*; do
+        [ -d "$d" ] || continue
+        local epoch_num="${d##*_}"
+        if [ "$epoch_num" -gt "$best_epoch" ] 2>/dev/null; then
+            best_epoch=$epoch_num
+            best_path="$d/denoiser.pth"
+        fi
+    done
+    [ -f "$best_path" ] && echo "$best_path" || echo ""
+}
+
+# ---------------------------------------------------------------------------
+
 cd "$FUSION_DIR"
 
 if [ "$PHASE" = "phase1" ]; then
+    # train.py auto-resumes from saved_checkpoints_phase1/ if a checkpoint exists.
     echo "Phase 1: single-step warmup (pred_horizon=5, seq_length=1)"
     python train.py --config configs/config_phase1.yml
 
@@ -81,7 +107,7 @@ elif [ "$PHASE" = "phase2" ]; then
     BASE_CFG="configs/config.yml"
 
     if [ -n "$PHASE1_CKPT_OVERRIDE" ]; then
-        # Resolve to absolute if relative
+        # Explicit override provided on the command line.
         [[ "$PHASE1_CKPT_OVERRIDE" != /* ]] && PHASE1_CKPT_OVERRIDE="$REPO_ROOT/$PHASE1_CKPT_OVERRIDE"
         echo "Phase 2: overriding phase_one_checkpoint → $PHASE1_CKPT_OVERRIDE"
         TMPCONF=$(mktemp /tmp/gpc_mm_phase2_XXXXXX.yml)
@@ -90,8 +116,23 @@ elif [ "$PHASE" = "phase2" ]; then
         python train.py --config "$TMPCONF"
         rm -f "$TMPCONF"
     else
-        echo "Phase 2: using checkpoint path from $BASE_CFG"
-        python train.py --config "$BASE_CFG"
+        # No explicit override: auto-detect newest phase-1 checkpoint.
+        PHASE1_SAVE_DIR="$FUSION_DIR/saved_checkpoints_phase1"
+        AUTO_CKPT=$(find_latest_gpc_ckpt "$PHASE1_SAVE_DIR")
+
+        if [ -n "$AUTO_CKPT" ]; then
+            echo "Phase 2: auto-detected phase_one_checkpoint → $AUTO_CKPT"
+            TMPCONF=$(mktemp /tmp/gpc_mm_phase2_XXXXXX.yml)
+            sed "s|phase_one_checkpoint:.*|phase_one_checkpoint: $AUTO_CKPT|" \
+                "$BASE_CFG" > "$TMPCONF"
+            python train.py --config "$TMPCONF"
+            rm -f "$TMPCONF"
+        else
+            # No phase-1 checkpoint found; fall back to the path in the YAML
+            # (train.py will error if it is null/missing).
+            echo "Phase 2: no phase-1 checkpoint auto-detected; using path from $BASE_CFG"
+            python train.py --config "$BASE_CFG"
+        fi
     fi
 
 else

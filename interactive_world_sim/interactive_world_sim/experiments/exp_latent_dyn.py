@@ -2,8 +2,14 @@ from typing import Optional
 
 import torch
 
-from interactive_world_sim.algorithms.latent_dynamics import LatentWorldModel
+from interactive_world_sim.algorithms.latent_dynamics import (
+    LatentWorldModel,
+    LatentWorldModelEarlyFusion,
+    LatentWorldModelMiddleFusion,
+    LatentWorldModelLateFusion,
+)
 from interactive_world_sim.datasets.latent_dynamics import (
+    ManiFEELMultimodalDataset,
     ManiFEELZarrDataset,
     PushTZarrDataset,
     RealAlohaDataset,
@@ -18,11 +24,15 @@ class LatentDynExperiment(BaseLightningExperiment):
 
     compatible_algorithms = dict(
         latent_world_model=LatentWorldModel,
+        latent_world_model_early_fusion=LatentWorldModelEarlyFusion,
+        latent_world_model_middle_fusion=LatentWorldModelMiddleFusion,
+        latent_world_model_late_fusion=LatentWorldModelLateFusion,
     )
 
     compatible_datasets = dict(
         pusht_dataset=PushTZarrDataset,
         manifeel_dataset=ManiFEELZarrDataset,
+        manifeel_multimodal_dataset=ManiFEELMultimodalDataset,
         sim_aloha_dataset=SimAlohaDataset,
         real_aloha_dataset=RealAlohaDataset,
     )

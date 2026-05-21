@@ -2,21 +2,24 @@
 inner_model.py — Dual-stream inner model for middle-fusion multimodal world model.
 
 Architecture:
-  RGB stream   : (prev_rgb  concatenated with noisy_next_rgb) → conv_in_rgb → RGB encoder
-  Tactile stream: prev_tactile → conv_in_tac → tactile encoder
-  Bottleneck   : CrossModalAttention fuses both streams
-  Decoder      : shared decoder (using RGB skip connections) → conv_out → predicted next RGB frame
+  RGB stream   : (prev_rgb | noisy_next_rgb) → conv_in_rgb → RGB encoder
+  Tactile stream: (prev_tactile | noisy_next_tac) → conv_in_tac → tactile encoder
+  Bottleneck   : CrossModalAttention fuses both streams bidirectionally
+  RGB decoder  : fused RGB bottleneck + RGB skip connections → conv_out_rgb → next RGB
+  Tactile decoder: fused tactile bottleneck + tactile skip connections → conv_out_tac → next tactile
+
+Both modalities are prediction targets; each stream receives its own noisy next frame as input.
 
 Conditioning:
   - Diffusion noise level sigma via Fourier features
   - Previous-observation noise level via Fourier features
   - 7-DoF robot actions via a per-step linear embedding, flattened to cond_channels
   All three are summed and passed through a small MLP to give the global FiLM conditioning
-  vector consumed by every AdaGroupNorm in the two encoder streams and the decoder.
+  vector consumed by every AdaGroupNorm in the two encoder streams and the two decoders.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -59,12 +62,14 @@ class MiddleFusionInnerModel(nn.Module):
     Dual-stream diffusion denoiser with cross-modal attention at the bottleneck.
 
     Input channels:
-      RGB stream  : (num_steps_conditioning + 1) * img_channels
-                    = 4 past frames + 1 noisy next frame = 5 × 3 = 15 channels
-      Tactile stream: num_steps_conditioning * img_channels
-                    = 4 past frames = 4 × 3 = 12 channels
+      RGB stream    : (num_steps_conditioning + 1) * img_channels = 5 × 3 = 15 channels
+                      (4 past RGB frames + 1 noisy next RGB frame)
+      Tactile stream: (num_steps_conditioning + 1) * img_channels = 5 × 3 = 15 channels
+                      (4 past tactile frames + 1 noisy next tactile frame)
 
-    Output: predicted noise residual for the next RGB frame, shape (B, 3, H, W).
+    Output: tuple of predicted noise residuals —
+      out_rgb: (B, 3, H, W)  — noise residual for the next RGB frame
+      out_tac: (B, 3, H, W)  — noise residual for the next tactile frame
     """
 
     def __init__(self, cfg: MiddleFusionInnerModelConfig) -> None:
@@ -95,15 +100,12 @@ class MiddleFusionInnerModel(nn.Module):
         )
 
         # ---- Input conv layers (one per stream) ----------------------------
-        # RGB: n past frames + 1 noisy next frame
-        rgb_in_ch = (n + 1) * cfg.img_channels
-        self.conv_in_rgb = Conv3x3(rgb_in_ch, cfg.channels[0])
+        # Both streams: n past frames + 1 noisy next frame for that modality
+        in_ch = (n + 1) * cfg.img_channels
+        self.conv_in_rgb = Conv3x3(in_ch, cfg.channels[0])
+        self.conv_in_tac = Conv3x3(in_ch, cfg.channels[0])
 
-        # Tactile: n past frames only (no noisy future tactile)
-        tac_in_ch = n * cfg.img_channels
-        self.conv_in_tac = Conv3x3(tac_in_ch, cfg.channels[0])
-
-        # ---- Dual-stream UNet (encoders + cross-modal attn + decoder) ------
+        # ---- Dual-stream UNet (encoders + cross-modal attn + two decoders) --
         self.dual_unet = DualStreamUNet(
             cond_channels=cfg.cond_channels,
             depths=cfg.depths,
@@ -111,41 +113,46 @@ class MiddleFusionInnerModel(nn.Module):
             attn_depths=cfg.attn_depths,
         )
 
-        # ---- Output head ---------------------------------------------------
-        self.norm_out = GroupNorm(cfg.channels[0])
-        self.conv_out = Conv3x3(cfg.channels[0], cfg.img_channels)
-        nn.init.zeros_(self.conv_out.weight)
+        # ---- Separate output heads (one per modality) ----------------------
+        self.norm_out_rgb = GroupNorm(cfg.channels[0])
+        self.conv_out_rgb = Conv3x3(cfg.channels[0], cfg.img_channels)
+        nn.init.zeros_(self.conv_out_rgb.weight)
+
+        self.norm_out_tac = GroupNorm(cfg.channels[0])
+        self.conv_out_tac = Conv3x3(cfg.channels[0], cfg.img_channels)
+        nn.init.zeros_(self.conv_out_tac.weight)
 
     # ------------------------------------------------------------------
 
     def forward(
         self,
-        noisy_next_rgb: Tensor,   # (B, 3, H, W)         noisy target RGB frame
-        c_noise: Tensor,           # (B,)                  log-sigma / 4
-        c_noise_cond: Tensor,      # (B,)                  log-sigma_cond / 4
-        prev_rgb: Tensor,          # (B, n*3, H, W)        concatenated past RGB frames
-        prev_tactile: Tensor,      # (B, n*3, H, W)        concatenated past tactile frames
-        act: Tensor,               # (B, n, num_actions)   conditioning window actions
-    ) -> Tensor:
+        noisy_next_rgb: Tensor,   # (B, 3, H, W)       noisy target RGB frame
+        noisy_next_tac: Tensor,   # (B, 3, H, W)       noisy target tactile frame
+        c_noise: Tensor,           # (B,)               log-sigma / 4
+        c_noise_cond: Tensor,      # (B,)               log-sigma_cond / 4
+        prev_rgb: Tensor,          # (B, n*3, H, W)     concatenated past RGB frames
+        prev_tactile: Tensor,      # (B, n*3, H, W)     concatenated past tactile frames
+        act: Tensor,               # (B, n, num_actions) conditioning window actions
+    ) -> Tuple[Tensor, Tensor]:
         # ---- Build global conditioning vector ------------------------------
-        act_emb = self.act_emb(act)                    # (B, cond_channels)
+        act_emb = self.act_emb(act)
         cond = self.cond_proj(
-            self.noise_emb(c_noise)
-            + self.noise_cond_emb(c_noise_cond)
-            + act_emb
-        )                                              # (B, cond_channels)
+            self.noise_emb(c_noise) + self.noise_cond_emb(c_noise_cond) + act_emb
+        )  # (B, cond_channels)
 
         # ---- Project raw pixels into feature space -------------------------
-        # RGB stream: past frames + noisy next frame concatenated on channel dim
-        rgb_input = torch.cat([prev_rgb, noisy_next_rgb], dim=1)  # (B, (n+1)*3, H, W)
-        rgb_feat = self.conv_in_rgb(rgb_input)                    # (B, channels[0], H, W)
+        # Each stream receives its own past frames + noisy next target frame
+        rgb_feat = self.conv_in_rgb(
+            torch.cat([prev_rgb, noisy_next_rgb], dim=1)     # (B, (n+1)*3, H, W)
+        )
+        tac_feat = self.conv_in_tac(
+            torch.cat([prev_tactile, noisy_next_tac], dim=1)  # (B, (n+1)*3, H, W)
+        )
 
-        # Tactile stream: past frames only
-        tac_feat = self.conv_in_tac(prev_tactile)                 # (B, channels[0], H, W)
+        # ---- Dual-stream forward (encode → cross-modal → two decoders) ----
+        rgb_out_feat, tac_out_feat = self.dual_unet(rgb_feat, tac_feat, cond)
 
-        # ---- Dual-stream forward (encode → cross-modal → decode) -----------
-        out = self.dual_unet(rgb_feat, tac_feat, cond)            # (B, channels[0], H, W)
-
-        # ---- Output projection ---------------------------------------------
-        out = self.conv_out(F.silu(self.norm_out(out)))           # (B, 3, H, W)
-        return out
+        # ---- Separate output heads -----------------------------------------
+        out_rgb = self.conv_out_rgb(F.silu(self.norm_out_rgb(rgb_out_feat)))  # (B, 3, H, W)
+        out_tac = self.conv_out_tac(F.silu(self.norm_out_tac(tac_out_feat)))  # (B, 3, H, W)
+        return out_rgb, out_tac
