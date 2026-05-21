@@ -7,3 +7,4 @@ dataset/
 all_checkpoints/
 wam/
 slurm_logs/
+gpc_wam_evaluation_output/
