@@ -1,6 +1,8 @@
 .claude/
 wandb/
 
+*.ckpt
+
 dataset/
 all_checkpoints/
 wam/
