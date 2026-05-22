@@ -1,4 +1,4 @@
-dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
+dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code/dataset/manifeel/data
 models_save_dir: saved_checkpoints_phase1
 
 # Training hyperparameters

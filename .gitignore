@@ -2,14 +2,21 @@
 wandb/
 
 *.ckpt
+<<<<<<< HEAD
 *.pth
+=======
+>>>>>>> 3158cf57c68130dfbd69117df9148db77174a670
 
 dataset/
 all_checkpoints/
 wam/
 slurm_logs/
+<<<<<<< HEAD
 gpc_wam_evaluation_output/
 *_output/
 
 outputs/
 saved_checkpoints*
+=======
+gpc_wam_evaluation_output/
+>>>>>>> 3158cf57c68130dfbd69117df9148db77174a670

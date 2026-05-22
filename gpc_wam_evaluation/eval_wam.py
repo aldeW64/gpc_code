@@ -354,6 +354,7 @@ def eval_wam(config: Dict[str, Any]) -> np.ndarray:
         )
 
         # Prepare goal image at the resolution the world model compares at.
+<<<<<<< HEAD
         goal_img_raw = _goal_state_image(env)  # (3, resize_scale, resize_scale) in [0,1]
         _save_goal_image(os.path.join(output_dir, f"goal_image_ep{ep:03d}.png"), goal_img_raw)
         # Save one (observation, goal) pair from the very first episode for inspection.
@@ -362,6 +363,10 @@ def eval_wam(config: Dict[str, Any]) -> np.ndarray:
             np.save(os.path.join(output_dir, "obs_ep000.npy"), obs["image"])
             np.save(os.path.join(output_dir, "goal_ep000.npy"), goal_img_raw)
             print(f"[gpc_wam_eval] saved (obs, goal) pair for ep0 to {output_dir}", flush=True)
+=======
+        goal_img_raw = _goal_only_image(env)  # (3, resize_scale, resize_scale) in [0,1]
+        _save_goal_image(os.path.join(output_dir, f"goal_image_ep{ep:03d}.png"), goal_img_raw)
+>>>>>>> 3158cf57c68130dfbd69117df9148db77174a670
         goal_img_t = _prepare_goal_image_t(goal_img_raw, wm_type, wam_cfg, device)
 
         rewards = []

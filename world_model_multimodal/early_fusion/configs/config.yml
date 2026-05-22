@@ -2,7 +2,11 @@
 # ============================================================
 
 # Dataset
+<<<<<<< HEAD
 dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
+=======
+dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code/dataset/manifeel/data
+>>>>>>> 3158cf57c68130dfbd69117df9148db77174a670
 
 # Output
 models_save_dir: saved_checkpoints_phase2
