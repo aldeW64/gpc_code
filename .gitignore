@@ -2,6 +2,7 @@
 wandb/
 
 *.ckpt
+*.pth
 
 dataset/
 all_checkpoints/
@@ -11,3 +12,4 @@ gpc_wam_evaluation_output/
 *_output/
 
 outputs/
+saved_checkpoints*
