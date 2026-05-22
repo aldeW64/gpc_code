@@ -1,11 +1,11 @@
-dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code/dataset/manifeel/data
+dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
 models_save_dir: saved_checkpoints_phase1
 
 # Training
 num_epochs: 100
 batch_size: 8
 lr: 1.0e-4
-wandb: false
+wandb: true
 
 # Phase 1: obs_horizon=4, pred_horizon=5 → seq_length = 1 (single-step warmup).
 obs_horizon: 4

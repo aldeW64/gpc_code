@@ -51,10 +51,21 @@ def _to_torch_image(chw: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.from_numpy(chw).to(device=device, dtype=torch.float32)
 
 
-def _goal_only_image(env: PushTImageEnv) -> np.ndarray:
-    # Uses internal helper already implemented in env.
-    img = env._render_frame_target_only(mode="rgb_array")
-    # env returns HWC uint8, convert to CHW float [0,1]
+def _goal_state_image(env: PushTImageEnv) -> np.ndarray:
+    """
+    Render the scene with the T-block placed at the goal pose.
+    This is what a perfectly solved episode looks like: red T covering the black
+    goal outline. Using _render_frame_target_only (goal outline only, no T) was
+    wrong because the world model always predicts the full scene including the red
+    T, so -MSE against a target-only image is never small even for a perfect match.
+    """
+    old_pos = env.block.position
+    old_angle = env.block.angle
+    env.block.position = env.goal_pose[:2].tolist()
+    env.block.angle = float(env.goal_pose[2])
+    img = env._render_frame(mode="rgb_array")
+    env.block.position = old_pos
+    env.block.angle = old_angle
     img = img.astype(np.float32) / 255.0
     return np.moveaxis(img, -1, 0)
 
@@ -343,8 +354,14 @@ def eval_wam(config: Dict[str, Any]) -> np.ndarray:
         )
 
         # Prepare goal image at the resolution the world model compares at.
-        goal_img_raw = _goal_only_image(env)  # (3, resize_scale, resize_scale) in [0,1]
+        goal_img_raw = _goal_state_image(env)  # (3, resize_scale, resize_scale) in [0,1]
         _save_goal_image(os.path.join(output_dir, f"goal_image_ep{ep:03d}.png"), goal_img_raw)
+        # Save one (observation, goal) pair from the very first episode for inspection.
+        if ep == 0:
+            _save_goal_image(os.path.join(output_dir, "obs_image_ep000.png"), obs["image"])
+            np.save(os.path.join(output_dir, "obs_ep000.npy"), obs["image"])
+            np.save(os.path.join(output_dir, "goal_ep000.npy"), goal_img_raw)
+            print(f"[gpc_wam_eval] saved (obs, goal) pair for ep0 to {output_dir}", flush=True)
         goal_img_t = _prepare_goal_image_t(goal_img_raw, wm_type, wam_cfg, device)
 
         rewards = []
@@ -417,6 +434,23 @@ def eval_wam(config: Dict[str, Any]) -> np.ndarray:
                     scores.append(_mse_reward(pred_final.to(device), goal_img_t))
                 best_idx = int(np.argmax(np.asarray(scores)))
                 action_pick = candidates[best_idx]
+
+                # Save the full predicted trajectory for the best candidate at the first
+                # planning step of ep 0. Only supported for the GPC world model.
+                if ep == 0 and step_idx == 0 and wm_type == "gpc":
+                    traj = world_model.rollout_trajectory(wm_hist, action_pick[:wm_num_frames])
+                    # traj: (T, 3, H, W) float32 [0,1]
+                    np.save(os.path.join(output_dir, "wm_trajectory_ep000.npy"), traj)
+                    traj_frames_hwc = [
+                        (np.moveaxis(traj[i], 0, -1) * 255).clip(0, 255).astype(np.uint8)
+                        for i in range(len(traj))
+                    ]
+                    _maybe_vwrite(os.path.join(output_dir, "wm_trajectory_ep000.mp4"), traj_frames_hwc, enabled=True)
+                    print(
+                        f"[gpc_wam_eval] saved world model trajectory ({len(traj)} frames) "
+                        f"to {output_dir}/wm_trajectory_ep000.{{npy,mp4}}",
+                        flush=True,
+                    )
 
                 for i in range(action_pick.shape[0]):
                     obs, reward, terminated, truncated, _info = env.step(action_pick[i])

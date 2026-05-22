@@ -1,4 +1,4 @@
-dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code/dataset/manifeel/data
+dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
 models_save_dir: saved_checkpoints_phase1
 
 # Training hyperparameters
@@ -12,7 +12,7 @@ lr: 1.0e-4
 save_every: 1
 
 # Logging
-wandb: false
+wandb: true
 
 # Late Fusion loss balance
 loss_alpha: 0.5

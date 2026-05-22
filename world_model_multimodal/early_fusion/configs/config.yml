@@ -2,7 +2,7 @@
 # ============================================================
 
 # Dataset
-dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code/dataset/manifeel/data
+dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
 
 # Output
 models_save_dir: saved_checkpoints_phase2
@@ -21,7 +21,7 @@ pred_horizon: 8
 resize_scale: 96
 
 # Logging — set to true to enable Weights & Biases logging
-wandb: false
+wandb: true
 
 # Phase 2: path to the final Phase-1 checkpoint (denoiser.pth).
 # Set to null to train from scratch (not recommended).

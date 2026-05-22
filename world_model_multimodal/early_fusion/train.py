@@ -126,7 +126,7 @@ def main() -> None:
     # ---- wandb (optional) ----
     if use_wandb:
         import wandb
-        wandb.init(project="early_fusion_world_model", config=config, name="early_fusion")
+        wandb.init(project="early_fusion_world_model", entity="projects-wpl", config=config, name="early_fusion")
     else:
         print("Warning: wandb is disabled")
 

@@ -86,31 +86,24 @@ class GpcWorldModelAdapter:
         print(f"[gpc_wm] loaded GPC world model from {cfg.ckpt_path}", flush=True)
 
     @torch.no_grad()
-    def rollout_final_image(
+    def _rollout(
         self,
         history_images_chw: np.ndarray,  # (N >= 4, 3, H, W) float32 in [0,1]
         actions: np.ndarray,              # (T, 2)  float32 in env pixel coords [0,511]
-    ) -> torch.Tensor:
-        """
-        Autoregressively predicts T future frames and returns the last one.
-        Returns (3, H, W) float32 in [0,1] on CPU.
-        """
+    ) -> list:
+        """Core autoregressive rollout. Returns list of T predicted frames (3,H,W) float32 [0,1]."""
         T = len(actions)
         n = _NUM_COND
         assert history_images_chw.shape[0] >= n, (
             f"GpcWorldModelAdapter needs >= {n} history frames, got {history_images_chw.shape[0]}"
         )
 
-        # Normalize actions to [0,1]
         norm_acts = (actions.astype(np.float32) - _ACTION_MIN) / (_ACTION_MAX - _ACTION_MIN)
-
-        # Action buffer: positions 0..n-1 are the (unknown) history-window actions → zeros.
-        # Positions n..n+T-1 are the future actions we want to roll out.
         act_buf = np.zeros((n + T, 2), dtype=np.float32)
         act_buf[n:] = norm_acts
 
-        # Sliding context window, seeded from the last n history frames
         window: list[np.ndarray] = list(history_images_chw[-n:])
+        predicted: list[np.ndarray] = []
 
         for t in range(T):
             prev_imgs = np.stack(window[-n:])  # (n, 3, H, W)
@@ -119,8 +112,26 @@ class GpcWorldModelAdapter:
 
             pred, _ = self.sampler.sample(img_t, act_t)  # (1, 3, H, W) in [-1,1]
 
-            # Convert output back to [0,1] so the context window stays in a consistent range
             pred_01 = ((pred.squeeze(0).cpu().float() + 1.0) / 2.0).clamp(0.0, 1.0).numpy()
             window.append(pred_01)
+            predicted.append(pred_01)
 
-        return torch.from_numpy(window[-1]).float()  # (3, H, W) in [0,1]
+        return predicted
+
+    @torch.no_grad()
+    def rollout_final_image(
+        self,
+        history_images_chw: np.ndarray,
+        actions: np.ndarray,
+    ) -> torch.Tensor:
+        """Returns the last predicted frame (3, H, W) float32 [0,1] on CPU."""
+        return torch.from_numpy(self._rollout(history_images_chw, actions)[-1]).float()
+
+    @torch.no_grad()
+    def rollout_trajectory(
+        self,
+        history_images_chw: np.ndarray,  # (N >= 4, 3, H, W) float32 in [0,1]
+        actions: np.ndarray,              # (T, 2)  float32 in env pixel coords [0,511]
+    ) -> np.ndarray:
+        """Returns all T predicted frames as (T, 3, H, W) float32 [0,1]."""
+        return np.stack(self._rollout(history_images_chw, actions))

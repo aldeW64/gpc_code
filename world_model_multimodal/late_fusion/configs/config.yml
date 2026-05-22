@@ -1,4 +1,4 @@
-dataset_path: /n/holylabs/ydu_lab/Lab/pwu/Projects/gpc_code/dataset/manifeel/data
+dataset_path: /net/holy-nfsisilon/ifs/rc_labs/ydu_lab/pwu/Projects/gpc_code/dataset/manifeel
 models_save_dir: saved_checkpoints_phase2
 
 # Training hyperparameters
@@ -13,7 +13,7 @@ lr: 1.0e-4
 save_every: 1         # save a checkpoint every N epochs
 
 # Logging
-wandb: false
+wandb: true
 
 # Phase 2: path to the final Phase-1 checkpoint (late_fusion_denoiser.pth).
 # Set to null to train from scratch (not recommended).

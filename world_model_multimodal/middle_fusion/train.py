@@ -149,6 +149,7 @@ def main() -> None:
         import wandb
         wandb.init(
             project="middle_fusion_world_model",
+            entity="projects-wpl",
             config=config,
             name="middle_fusion_world_model",
         )

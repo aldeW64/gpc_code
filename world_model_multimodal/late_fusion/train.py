@@ -126,6 +126,7 @@ def main() -> None:
         else:
             wandb.init(
                 project="late_fusion_world_model",
+                entity="projects-wpl",
                 config=config,
                 name="late_fusion_multimodal",
             )
